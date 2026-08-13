@@ -37,7 +37,7 @@ The server listens on `http://localhost:9191` by default.
 - `GET /cookies?force=1` — returns the current `cf_clearance`, `waf_pass` and `user_agent` (used when a page is served a fresh captcha).
 - `GET /material` — returns the current JS cipher material as `{"s":[...],"k":[...]}`.
 - `POST /refresh-material` — re-extracts the cipher material from the live site with Playwright (triggered by the extension when a material rotation is detected).
-- `POST /reload-material` — reloads the embedded material from `material.json` without re-extracting.
+- `POST /load-material` — ensures cipher material is available, extracting it from the live site with Playwright if none is on disk; returns a status (whether it was already loaded, extracted, or failed).
 - `GET /decrypt?e=${envelope}` — decodes a signed API envelope.
 - `GET /health` — simple liveness check.
 
