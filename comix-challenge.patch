@@ -12,7 +12,7 @@ index 85c6d8458..5621a43ed 100644
      libVersion = "1.4"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..5da30f9aa 100644
+index ad0975942..5d44fb418 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 @@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
@@ -66,7 +66,7 @@ index ad0975942..5da30f9aa 100644
          .addInterceptor(Descrambler.interceptor)
          .addInterceptor { chain ->
              val request = chain.request()
-@@ -91,9 +103,235 @@ abstract class Comix :
+@@ -91,9 +103,270 @@ abstract class Comix :
          .add("Referer", "$baseUrl/")
          .add("Origin", baseUrl)
          .add("Accept", "*/*")
@@ -147,7 +147,7 @@ index ad0975942..5da30f9aa 100644
 +        params: Map<String, List<String>>,
 +        forceRefresh: Boolean = false,
 +    ): ProxySignResponse? {
-+        val qs = ComixCrypto.canonicalizes(params)
++        val qs = canonicalizes(params)
 +        val url = proxy.trimEnd('/') +
 +            "/sign?path=" + URLEncoder.encode(path, "UTF-8") +
 +            "&qs=" + URLEncoder.encode(qs, "UTF-8") +
@@ -163,15 +163,50 @@ index ad0975942..5da30f9aa 100644
 +        }.getOrNull()?.also { saveProxySession(it) }
 +    }
 +
-+    /** Fetches the proxy's current cipher material (`/material`, `{s:[],k:[]}`). */
-+    private fun proxyMaterial(proxy: String): ComixMaterial? {
-+        val url = proxy.trimEnd('/') + "/material"
++    /**
++     * Builds the canonical, sorted, indexed query string exactly like the site's
++     * serializer: keys sorted, list values expanded to `key[i]=value`, single
++     * values emitted as `key=value`, values URL-encoded like JS
++     * `encodeURIComponent`.
++     */
++    private fun canonicalizes(params: Map<String, List<String>>): String = buildList {
++        for (key in params.keys.sorted()) {
++            val entry = params.getValue(key)
++            if (entry.size == 1) {
++                add("$key=${encodeURIComponent(entry[0])}")
++            } else {
++                entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
++            }
++        }
++    }.joinToString("&")
++
++    /** JS `encodeURIComponent`: unreserved chars pass through, everything else %-escaped UTF-8. */
++    private fun encodeURIComponent(value: String): String {
++        val out = StringBuilder()
++        for (b in value.toByteArray(Charsets.UTF_8)) {
++            val c = b.toInt() and 0xFF
++            if (
++                (c in 'A'.code..'Z'.code) || (c in 'a'.code..'z'.code) || (c in '0'.code..'9'.code) ||
++                c == '-'.code || c == '_'.code || c == '.'.code || c == '!'.code ||
++                c == '~'.code || c == '*'.code || c == '\''.code || c == '('.code || c == ')'.code
++            ) {
++                out.append(c.toChar())
++            } else {
++                out.append('%').append(HEX[(c ushr 4) and 0xF]).append(HEX[c and 0xF])
++            }
++        }
++        return out.toString()
++    }
++
++    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt`. */
++    private fun proxyDecrypt(proxy: String, e: String): String? {
++        val url = proxy.trimEnd('/') + "/decrypt?e=" + URLEncoder.encode(e, "UTF-8")
 +        return runCatching {
 +            client.newCall(GET(url, headers)).execute().use { resp ->
 +                if (!resp.isSuccessful) {
 +                    null
 +                } else {
-+                    resp.body.string().let { ComixMaterial.tryFromJson(it) }
++                    resp.parseAs<ProxyDecryptResponse>().json
 +                }
 +            }
 +        }.getOrNull()
@@ -302,7 +337,7 @@ index ad0975942..5da30f9aa 100644
      // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
      // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
      override fun imageRequest(page: Page): Request {
-@@ -137,8 +375,13 @@ abstract class Comix :
+@@ -137,8 +410,13 @@ abstract class Comix :
      )
  
      private fun fetchMangaListFromBrowse(request: Request): Observable<MangasPage> = Observable.fromCallable {
@@ -317,7 +352,7 @@ index ad0975942..5da30f9aa 100644
          }
          val contentRating = request.url.queryParameter("content_rating")
              ?: preferences.contentRating()
-@@ -270,7 +513,7 @@ abstract class Comix :
+@@ -270,7 +548,7 @@ abstract class Comix :
          val mangaList = searchResponse.result.items.map {
              it.toBasicSManga(preferences.posterQuality())
          }
@@ -326,7 +361,7 @@ index ad0975942..5da30f9aa 100644
      }
  
      private fun Document.extractBrowseResponse(): SearchResponse? {
-@@ -489,7 +732,7 @@ abstract class Comix :
+@@ -489,7 +767,7 @@ abstract class Comix :
  
      override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
          val document = runBlocking {
@@ -335,7 +370,7 @@ index ad0975942..5da30f9aa 100644
          }
  
          val initialData = document.selectFirst("script#initial-data")?.data()
-@@ -516,12 +759,14 @@ abstract class Comix :
+@@ -516,12 +794,14 @@ abstract class Comix :
      override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
  
      override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
@@ -353,7 +388,7 @@ index ad0975942..5da30f9aa 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -620,34 +865,8 @@ abstract class Comix :
+@@ -620,34 +900,8 @@ abstract class Comix :
              },
          )
  
@@ -390,7 +425,7 @@ index ad0975942..5da30f9aa 100644
      }
  
      override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
-@@ -685,11 +904,43 @@ abstract class Comix :
+@@ -685,11 +939,43 @@ abstract class Comix :
          }
      }
  
@@ -436,7 +471,7 @@ index ad0975942..5da30f9aa 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -734,10 +985,15 @@ abstract class Comix :
+@@ -734,10 +1020,15 @@ abstract class Comix :
              },
          )
  
@@ -454,71 +489,40 @@ index ad0975942..5da30f9aa 100644
              val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
              // V3 pages need the query flag so the server returns grid-scramble headers.
              // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -756,6 +1012,211 @@ abstract class Comix :
+@@ -756,6 +1047,180 @@ abstract class Comix :
          }
      }
  
 +    // ====================== Native signed API =========================
 +    // The /api/v1/* endpoints require every request to carry a `_` token minted
-+    // with the site's live cipher material (see ComixMaterial), which comes from
-+    // the proxy server; responses are plaintext JSON. Native calls are a cheap
-+    // alternative to booting the SPA in a WebView; a signature rejection means
-+    // the site rotated its material, so the cache is dropped, the material is
-+    // re-fetched from the proxy, and the call retried once before falling back
-+    // to the WebView path.
++    // by the proxy server (which holds the site's live cipher material);
++    // responses are plaintext JSON, or an `"e"` envelope that the proxy decrypts
++    // on request. Native calls are a cheap alternative to booting the SPA in a
++    // WebView; a signature rejection (403 "Invalid/Missing token") or an
++    // undecryptable envelope means the site rotated its material, so the proxy
++    // re-extracts it and the call is retried once before falling back to the
++    // WebView path.
 +
 +    private class CipherRotatedException(message: String) : Exception(message)
 +
-+    private fun cachedMaterial(): ComixMaterial? = preferences.getString(PREF_CIPHER_MATERIAL, null)
-+        ?.let { ComixMaterial.tryFromJson(it) }
-+
-+    private fun cacheMaterial(material: ComixMaterial) {
-+        preferences.edit().putString(PREF_CIPHER_MATERIAL, material.toJsonString()).apply()
-+    }
-+
-+    private fun clearCachedMaterial() {
-+        preferences.edit().remove(PREF_CIPHER_MATERIAL).apply()
-+    }
-+
 +    /**
-+     * Runs [block] with the cached (or freshly fetched) cipher, persisting the
-+     * material only after it produced a valid response. A signature rejection
-+     * (the site rotated its material) clears the cache, re-fetches once, and
-+     * retries; any other failure returns null so callers fall back to WebView.
-+     *
-+     * Material always comes from the proxy server: the extension no longer
-+     * extracts the cipher bundles itself, and a rotation triggers a proxy-side
-+     * re-extraction.
++     * Runs [block] against the proxy-minted API, retrying once with a forced
++     * material refresh when the site rotated its material. Any other failure
++     * returns null so callers fall back to WebView.
 +     */
-+    private fun <T> withCipher(block: (ComixCipher) -> T): T? {
++    private fun <T> withProxy(block: () -> T): T? {
 +        val proxy = proxyServer() ?: return null
-+        var material = cachedMaterial()
-+        if (material == null) {
-+            material = proxyMaterial(proxy)
-+        }
-+        if (material == null) {
-+            return null
-+        }
-+
-+        try {
-+            val result = block(material.toCipher())
-+            cacheMaterial(material)
-+            return result
++        return try {
++            block()
 +        } catch (e: CipherRotatedException) {
-+            clearCachedMaterial()
 +            refreshProxyMaterial(proxy)
-+            val fresh = proxyMaterial(proxy) ?: return null
-+            val result = try {
-+                block(fresh.toCipher())
++            try {
++                block()
 +            } catch (e2: Exception) {
 +                null
 +            }
-+            if (result != null) {
-+                cacheMaterial(fresh)
-+            }
-+            return result
 +        } catch (e: Exception) {
-+            return null
++            null
 +        }
 +    }
 +
@@ -594,7 +598,7 @@ index ad0975942..5da30f9aa 100644
 +        return GET(builder.build(), headers)
 +    }
 +
-+    private fun responseBodyOrThrow(response: Response, cipher: ComixCipher): String {
++    private fun responseBodyOrThrow(response: Response): String {
 +        val body = response.body.string()
 +        response.close()
 +        if (response.code == 403 &&
@@ -608,25 +612,25 @@ index ad0975942..5da30f9aa 100644
 +        if (!response.isSuccessful) {
 +            throw Exception("API returned ${response.code}")
 +        }
-+        return decodeSignal(body, cipher)
++        return decodeSignal(body)
 +    }
 +
-+    /** Passes plaintext responses through; decrypts an `"e"` envelope if present. */
-+    private fun decodeSignal(body: String, cipher: ComixCipher): String {
++    /** Passes plaintext responses through; asks the proxy to decrypt an `"e"` envelope if present. */
++    private fun decodeSignal(body: String): String {
 +        val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
 +            ?: return body
 +        val e = root["e"] as? JsonPrimitive ?: return body
-+        val decrypted = String(cipher.decryptE(e.content), Charsets.UTF_8)
-+        val parsed = runCatching { decrypted.parseAs<JsonObject>() }.getOrNull()
++        val decrypted = proxyServer()?.let { proxyDecrypt(it, e.content) }
++        val parsed = runCatching { decrypted?.parseAs<JsonObject>() }.getOrNull()
 +        if (parsed == null) {
-+            throw CipherRotatedException(decrypted.take(160))
++            throw CipherRotatedException((decrypted ?: "decrypt failed").take(160))
 +        }
-+        return decrypted
++        return decrypted!!
 +    }
 +
-+    private fun nativeMangaList(request: Request): MangasPage? = withCipher { cipher ->
++    private fun nativeMangaList(request: Request): MangasPage? = withProxy {
 +        val response = executeSigned("/api/v1/manga", nativeMangaParams(request.url))
-+        val items = responseBodyOrThrow(response, cipher).parseAs<SearchResponse>().result
++        val items = responseBodyOrThrow(response).parseAs<SearchResponse>().result
 +        MangasPage(
 +            items.items.map { it.toBasicSManga(preferences.posterQuality()) },
 +            items.hasNextPage(),
@@ -636,7 +640,7 @@ index ad0975942..5da30f9aa 100644
 +    private fun nativeChapterList(manga: SManga): List<SChapter>? {
 +        val mangaSlug = manga.url.removePrefix("/")
 +        val hid = mangaSlug.substringBefore("-").takeIf { it.isNotBlank() } ?: return null
-+        return withCipher { cipher ->
++        return withProxy {
 +            val allChapters = mutableListOf<Chapter>()
 +            var page = 1
 +            while (page <= NATIVE_MAX_CHAPTER_PAGES) {
@@ -646,7 +650,7 @@ index ad0975942..5da30f9aa 100644
 +                    "order[number]" to listOf("desc"),
 +                )
 +                val response = executeSigned("/api/v1/manga/$hid/chapters", params)
-+                val result = responseBodyOrThrow(response, cipher).parseAs<ChapterDetailsResponse>().result
++                val result = responseBodyOrThrow(response).parseAs<ChapterDetailsResponse>().result
 +                allChapters += result.items
 +                if (!result.hasNextPage() || result.items.isEmpty()) break
 +                page++
@@ -657,16 +661,16 @@ index ad0975942..5da30f9aa 100644
 +
 +    private fun nativePageList(chapter: SChapter): List<Page>? {
 +        val cid = PAGE_ID_REGEX.find(chapter.url)?.groupValues?.get(1) ?: return null
-+        return withCipher { cipher ->
++        return withProxy {
 +            val response = executeSigned("/api/v1/chapters/$cid", emptyMap())
-+            buildPages(responseBodyOrThrow(response, cipher).parseAs<ChapterResponse>())
++            buildPages(responseBodyOrThrow(response).parseAs<ChapterResponse>())
 +        }
 +    }
 +
      override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
  
      override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -812,6 +1273,7 @@ abstract class Comix :
+@@ -812,6 +1277,7 @@ abstract class Comix :
                  CookieManager.getInstance().apply {
                      setAcceptCookie(true)
                      setAcceptThirdPartyCookies(view, true)
@@ -674,7 +678,7 @@ index ad0975942..5da30f9aa 100644
                  }
  
                  view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1367,11 @@ abstract class Comix :
+@@ -905,7 +1371,11 @@ abstract class Comix :
          if (!completed) {
              throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
          }
@@ -687,7 +691,7 @@ index ad0975942..5da30f9aa 100644
      }
  
      private class WebViewPayloadResult {
-@@ -940,6 +1406,16 @@ abstract class Comix :
+@@ -940,6 +1410,16 @@ abstract class Comix :
  
      // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -704,12 +708,11 @@ index ad0975942..5da30f9aa 100644
          ListPreference(screen.context).apply {
              key = PREF_POSTER_QUALITY
              title = "Thumbnail Quality"
-@@ -1107,14 +1583,24 @@ abstract class Comix :
+@@ -1107,14 +1587,23 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
 +        private const val PREF_WAF_COOKIE = "pref_waf_cookie"
-+        private const val PREF_CIPHER_MATERIAL = "pref_cipher_material"
 +        private const val PREF_PROXY_SERVER = "pref_proxy_server"
 +        private const val PREF_PROXY_COOKIE = "pref_proxy_cookie"
 +        private const val PREF_PROXY_USER_AGENT = "pref_proxy_user_agent"
@@ -729,165 +732,8 @@ index ad0975942..5da30f9aa 100644
          private val CHAPTER_NUM_REGEX = Regex("""Ch\.([\d.]+)""")
          private val GROUP_ID_REGEX = Regex("""/groups/(\d+)""")
          private val CHAPTER_ID_REGEX = Regex("""/(\d+)-""")
-diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt
-new file mode 100644
-index 000000000..4cead5355
---- /dev/null
-+++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt
-@@ -0,0 +1,151 @@
-+package eu.kanade.tachiyomi.extension.en.comix
-+
-+import android.util.Base64
-+import org.json.JSONArray
-+import org.json.JSONObject
-+
-+/**
-+ * The site's live cipher material: three 256-byte S-boxes and the three keys
-+ * (24/24/32 bytes). Fetched from the proxy server, cached in preferences, and
-+ * re-fetched when the site rotates it -- it is never embedded in source.
-+ */
-+internal class ComixMaterial(
-+    val sboxes: List<IntArray>,
-+    val keys: List<IntArray>,
-+) {
-+
-+    fun toCipher(): ComixCipher = ComixCipher(sboxes.toTypedArray(), keys.toTypedArray())
-+
-+    fun toJsonString(): String = JSONObject().apply {
-+        put("s", JSONArray().apply { sboxes.forEach { put(bytesToBase64(it)) } })
-+        put("k", JSONArray().apply { keys.forEach { put(bytesToBase64(it)) } })
-+    }.toString()
-+
-+    companion object {
-+        private const val COUNT = 3
-+
-+        fun tryFromJson(json: String?): ComixMaterial? {
-+            if (json.isNullOrBlank()) return null
-+            val root = runCatching { JSONObject(json) }.getOrNull() ?: return null
-+            val sboxes = decodeBlobs(root.optJSONArray("s")) ?: return null
-+            val keys = decodeBlobs(root.optJSONArray("k")) ?: return null
-+            if (sboxes.size != COUNT || keys.size != COUNT) return null
-+            if (sboxes.any { it.size != 256 || !it.isPermutation256() }) return null
-+            if (keys.any { it.size != 24 && it.size != 32 }) return null
-+            return ComixMaterial(sboxes, keys)
-+        }
-+
-+        private fun decodeBlobs(array: JSONArray?): List<IntArray>? = buildList {
-+            if (array == null) return null
-+            for (i in 0 until array.length()) {
-+                val bytes = runCatching { Base64.decode(array.getString(i), Base64.DEFAULT) }.getOrNull()
-+                    ?: return null
-+                add(IntArray(bytes.size) { bytes[it].toInt() and 0xFF })
-+            }
-+        }
-+
-+        private fun bytesToBase64(bytes: IntArray): String = Base64.encodeToString(ByteArray(bytes.size) { bytes[it].toByte() }, Base64.NO_WRAP)
-+    }
-+}
-+
-+internal fun IntArray.isPermutation256(): Boolean {
-+    if (size != 256) return false
-+    val seen = BooleanArray(256)
-+    for (v in this) {
-+        if (v < 0 || v > 255 || seen[v]) return false
-+        seen[v] = true
-+    }
-+    return true
-+}
-+
-+/**
-+ * Pure-Kotlin port of the site's request-signing cipher: three CBC-ish S-box
-+ * rounds over [0,255] bytes. The S-boxes and keys are the site's cipher
-+ * material -- fetched from the proxy server (see [ComixMaterial]), never
-+ * embedded in source. Only the per-round chaining seeds are literal site
-+ * constants.
-+ */
-+internal object ComixCrypto {
-+
-+    /**
-+     * Builds the canonical, sorted, indexed query string exactly like the
-+     * site's `Z0` serializer: keys sorted, list values expanded to
-+     * `key[i]=value`, single values emitted as `key=value`, values
-+     * URL-encoded like JS `encodeURIComponent`.
-+     */
-+    fun canonicalizes(params: Map<String, List<String>>): String {
-+        val parts = buildList {
-+            for (key in params.keys.sorted()) {
-+                val entry = params.getValue(key)
-+                if (entry.size == 1) {
-+                    add("$key=${encodeURIComponent(entry[0])}")
-+                } else {
-+                    entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
-+                }
-+            }
-+        }
-+        return parts.joinToString("&")
-+    }
-+
-+    /** JS `encodeURIComponent`: unreserved chars pass through, everything else %-escaped UTF-8. */
-+    fun encodeURIComponent(value: String): String {
-+        val out = StringBuilder()
-+        for (b in value.toByteArray(Charsets.UTF_8)) {
-+            val c = b.toInt() and 0xFF
-+            if (
-+                (c in 'A'.code..'Z'.code) || (c in 'a'.code..'z'.code) || (c in '0'.code..'9'.code) ||
-+                c == '-'.code || c == '_'.code || c == '.'.code || c == '!'.code ||
-+                c == '~'.code || c == '*'.code || c == '\''.code || c == '('.code || c == ')'.code
-+            ) {
-+                out.append(c.toChar())
-+            } else {
-+                out.append('%').append(HEX[(c ushr 4) and 0xF]).append(HEX[c and 0xF])
-+            }
-+        }
-+        return out.toString()
-+    }
-+
-+    private val HEX = "0123456789ABCDEF"
-+}
-+
-+internal class ComixCipher(
-+    private val sboxes: Array<IntArray>,
-+    private val keys: Array<IntArray>,
-+) {
-+    init {
-+        require(sboxes.size == 3) { "Expected 3 sboxes, got ${sboxes.size}" }
-+        require(keys.size == 3) { "Expected 3 keys, got ${keys.size}" }
-+        require(sboxes.all { it.size == 256 }) { "S-boxes must be 256 bytes" }
-+        require(keys.all { it.size == 24 || it.size == 32 }) { "Keys must be 24 or 32 bytes" }
-+    }
-+
-+    private val preves = intArrayOf(189, 133, 32)
-+
-+    /** Decrypts an `"e"` envelope field (inverse rounds 3->2->1) to raw JSON bytes. */
-+    fun decryptE(e: String): ByteArray {
-+        val raw = base64UrlDecode(e)
-+        val step2 = subRoundInv(raw, sboxes[2], keys[2], preves[2])
-+        val step1 = subRoundInv(step2, sboxes[1], keys[1], preves[1])
-+        return subRoundInv(step1, sboxes[0], keys[0], preves[0])
-+    }
-+
-+    private fun subRoundInv(data: ByteArray, sbox: IntArray, key: IntArray, prev: Int): ByteArray {
-+        val inv = IntArray(256)
-+        for (i in 0..255) inv[sbox[i] and 0xFF] = i
-+        val out = ByteArray(data.size)
-+        var p = prev
-+        for (i in data.indices) {
-+            val b = data[i].toInt() and 0xFF
-+            val idx = inv[b]
-+            out[i] = (idx xor key[i % key.size] xor p).toByte()
-+            p = b
-+        }
-+        return out
-+    }
-+
-+    private fun base64UrlDecode(s: String): ByteArray {
-+        val fixed = s.replace('-', '+').replace('_', '/')
-+        val padded = fixed + "=".repeat((4 - fixed.length % 4) % 4)
-+        return Base64.decode(padded, Base64.DEFAULT)
-+    }
-+}
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
-index 8f69de428..a9886c638 100644
+index 8f69de428..72c619e98 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
 @@ -8,6 +8,24 @@ import java.math.BigDecimal
@@ -915,7 +761,7 @@ index 8f69de428..a9886c638 100644
  @Serializable
  class Term(
      val title: String,
-@@ -329,3 +347,20 @@ class ChapterResponse(
+@@ -329,3 +347,26 @@ class ChapterResponse(
          val s: Int = 0,
      )
  }
@@ -935,6 +781,12 @@ index 8f69de428..a9886c638 100644
 +    @SerialName("waf_pass") val wafPass: String,
 +    @SerialName("cf_clearance") val cfClearance: String,
 +    @SerialName("user_agent") val userAgent: String,
++)
++
++/** Response of the comix-proxy `/decrypt` endpoint. */
++@Serializable
++class ProxyDecryptResponse(
++    val json: String,
 +)
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt
 new file mode 100644

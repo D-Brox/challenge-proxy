@@ -31,19 +31,6 @@ FLARESOLVERR_URL=http://localhost:8191/v1 node server.mjs
 
 The server listens on `http://localhost:9191` by default.
 
-## Extension patch
-
-The `comix-challenge.patch` file in this repository is the client-side half: the
-changes to the Comix Tachiyomi/Suwayomi extension that make it talk to this
-server (proxy preference, `/sign`-minted tokens, mirrored `cf_clearance`/`waf_pass`
-cookies and UA, and proxy-fetched cipher material). It applies to a local
-`comix-challenge` branch created from the official extensions repository:
-
-```
-git checkout -b comix-challenge
-git apply --3way /path/to/challenge-proxy/comix-challenge.patch
-```
-
 ## Endpoints
 
 - `GET /sign?path=${api_path}&qs=${canonical_query}&force=1` — mints a signed `_` token for the API call and returns the current `cf_clearance`, `waf_pass` and `user_agent` to use with it.
@@ -57,10 +44,22 @@ git apply --3way /path/to/challenge-proxy/comix-challenge.patch
 ## How it works
 
 The comix.to API requires a per-request `_` token minted by obfuscated JS loaded in
-the browser. This proxy runs that cipher in pure Node (`lib/cipher.js`) so the
-extension never needs to boot a WebView for signing. The `cf_clearance` cookie is
-bound to the user agent it was solved with, so the proxy returns its UA alongside
-the cookies and the extension mirrors all three on its own requests.
+the browser, and some responses come back wrapped in an `"e"` envelope. This proxy
+runs the cipher in pure Node (`lib/cipher.js`) so the extension never needs to boot
+a WebView for signing or decryption. The `cf_clearance` cookie is bound to the
+user agent it was solved with, so the proxy returns its UA alongside the cookies
+and the extension mirrors all three on its own requests.
+
+The `comix-challenge.patch` file in this repository is the client-side half: the
+changes to the Comix Tachiyomi/Suwayomi extension that make it talk to this
+server (proxy preference, `/sign`-minted tokens, `/decrypt`-decoded envelopes,
+mirrored `cf_clearance`/`waf_pass` cookies and UA). It applies to a local
+`comix-challenge` branch created from that one extension repo:
+
+```
+git checkout -b comix-challenge
+git apply --3way /path/to/challenge-proxy/comix-challenge.patch
+```
 
 ## Disclaimer
 
