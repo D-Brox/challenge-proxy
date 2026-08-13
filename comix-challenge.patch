@@ -12,7 +12,7 @@ index 85c6d8458..5621a43ed 100644
      libVersion = "1.4"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..5d44fb418 100644
+index ad0975942..a283be706 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 @@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
@@ -66,7 +66,7 @@ index ad0975942..5d44fb418 100644
          .addInterceptor(Descrambler.interceptor)
          .addInterceptor { chain ->
              val request = chain.request()
-@@ -91,9 +103,270 @@ abstract class Comix :
+@@ -91,9 +103,275 @@ abstract class Comix :
          .add("Referer", "$baseUrl/")
          .add("Origin", baseUrl)
          .add("Accept", "*/*")
@@ -219,6 +219,11 @@ index ad0975942..5d44fb418 100644
 +        }
 +    }
 +
++    /** Ensures the proxy has material, extracting only when none is on disk. */
++    private fun ensureProxyMaterial(proxy: String): Boolean = runCatching {
++        client.newCall(POST(proxy.trimEnd('/') + "/load-material")).execute().use { it.isSuccessful }
++    }.getOrDefault(false)
++
 +    /**
 +     * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
 +     * is set (e.g. a request just came back as the challenge page) or none is
@@ -337,7 +342,7 @@ index ad0975942..5d44fb418 100644
      // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
      // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
      override fun imageRequest(page: Page): Request {
-@@ -137,8 +410,13 @@ abstract class Comix :
+@@ -137,8 +415,13 @@ abstract class Comix :
      )
  
      private fun fetchMangaListFromBrowse(request: Request): Observable<MangasPage> = Observable.fromCallable {
@@ -352,7 +357,7 @@ index ad0975942..5d44fb418 100644
          }
          val contentRating = request.url.queryParameter("content_rating")
              ?: preferences.contentRating()
-@@ -270,7 +548,7 @@ abstract class Comix :
+@@ -270,7 +553,7 @@ abstract class Comix :
          val mangaList = searchResponse.result.items.map {
              it.toBasicSManga(preferences.posterQuality())
          }
@@ -361,7 +366,7 @@ index ad0975942..5d44fb418 100644
      }
  
      private fun Document.extractBrowseResponse(): SearchResponse? {
-@@ -489,7 +767,7 @@ abstract class Comix :
+@@ -489,7 +772,7 @@ abstract class Comix :
  
      override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
          val document = runBlocking {
@@ -370,7 +375,7 @@ index ad0975942..5d44fb418 100644
          }
  
          val initialData = document.selectFirst("script#initial-data")?.data()
-@@ -516,12 +794,14 @@ abstract class Comix :
+@@ -516,12 +799,14 @@ abstract class Comix :
      override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
  
      override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
@@ -388,7 +393,7 @@ index ad0975942..5d44fb418 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -620,34 +900,8 @@ abstract class Comix :
+@@ -620,34 +905,8 @@ abstract class Comix :
              },
          )
  
@@ -425,7 +430,7 @@ index ad0975942..5d44fb418 100644
      }
  
      override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
-@@ -685,11 +939,43 @@ abstract class Comix :
+@@ -685,11 +944,43 @@ abstract class Comix :
          }
      }
  
@@ -471,7 +476,7 @@ index ad0975942..5d44fb418 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -734,10 +1020,15 @@ abstract class Comix :
+@@ -734,10 +1025,15 @@ abstract class Comix :
              },
          )
  
@@ -489,7 +494,7 @@ index ad0975942..5d44fb418 100644
              val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
              // V3 pages need the query flag so the server returns grid-scramble headers.
              // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -756,6 +1047,180 @@ abstract class Comix :
+@@ -756,6 +1052,184 @@ abstract class Comix :
          }
      }
  
@@ -548,11 +553,15 @@ index ad0975942..5d44fb418 100644
 +    }
 +
 +    /**
-+     * Proxy-backed [executeSigned]: mints the token via `/sign`, builds the URL
-+     * with the same canonical param ordering, and retries once with a forced
-+     * cookie refresh when the server answers with a challenge.
++     * Proxy-backed [executeSigned]: ensures material is loaded, mints the token
++     * via `/sign`, builds the URL with the same canonical param ordering, and
++     * retries once with a forced cookie refresh when the server answers with a
++     * challenge.
 +     */
 +    private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
++        if (!ensureProxyMaterial(proxy)) {
++            throw Exception("Proxy material not available")
++        }
 +        val sign = proxySign(proxy, path, params)
 +            ?: throw Exception("Proxy sign failed")
 +        var response = client.newCall(signedRequest(path, params, sign.token)).execute()
@@ -670,7 +679,7 @@ index ad0975942..5d44fb418 100644
      override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
  
      override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -812,6 +1277,7 @@ abstract class Comix :
+@@ -812,6 +1286,7 @@ abstract class Comix :
                  CookieManager.getInstance().apply {
                      setAcceptCookie(true)
                      setAcceptThirdPartyCookies(view, true)
@@ -678,7 +687,7 @@ index ad0975942..5d44fb418 100644
                  }
  
                  view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1371,11 @@ abstract class Comix :
+@@ -905,7 +1380,11 @@ abstract class Comix :
          if (!completed) {
              throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
          }
@@ -691,7 +700,7 @@ index ad0975942..5d44fb418 100644
      }
  
      private class WebViewPayloadResult {
-@@ -940,6 +1410,16 @@ abstract class Comix :
+@@ -940,6 +1419,16 @@ abstract class Comix :
  
      // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -708,7 +717,7 @@ index ad0975942..5d44fb418 100644
          ListPreference(screen.context).apply {
              key = PREF_POSTER_QUALITY
              title = "Thumbnail Quality"
-@@ -1107,14 +1587,23 @@ abstract class Comix :
+@@ -1107,14 +1596,23 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
