@@ -66,7 +66,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/reload-material' && req.method === 'POST') {
-      const material = reloadMaterial();
+      const material = await reloadMaterial();
       return send(res, 200, { material });
     }
 
@@ -102,7 +102,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  const mat = loadMaterial();
   console.log(`comix-proxy listening on :${PORT}`);
-  console.log(`material: sboxes=${mat.sboxes.map((s) => s.length).join('/')} keys=${mat.keys.map((k) => k.length).join('/')}`);
+  try {
+    const mat = loadMaterial();
+    console.log(`material: sboxes=${mat.sboxes.map((s) => s.length).join('/')} keys=${mat.keys.map((k) => k.length).join('/')}`);
+  } catch (e) {
+    console.log(`material: not yet extracted (call POST /reload-material to bootstrap)`);
+  }
 });
