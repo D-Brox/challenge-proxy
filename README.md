@@ -31,6 +31,19 @@ FLARESOLVERR_URL=http://localhost:8191/v1 node server.mjs
 
 The server listens on `http://localhost:9191` by default.
 
+## Extension patch
+
+The `comix-challenge.patch` file in this repository is the client-side half: the
+changes to the Comix Tachiyomi/Suwayomi extension that make it talk to this
+server (proxy preference, `/sign`-minted tokens, mirrored `cf_clearance`/`waf_pass`
+cookies and UA, and proxy-fetched cipher material). It applies to a local
+`comix-challenge` branch created from the official extensions repository:
+
+```
+git checkout -b comix-challenge
+git apply --3way /path/to/challenge-proxy/comix-challenge.patch
+```
+
 ## Endpoints
 
 - `GET /sign?path=${api_path}&qs=${canonical_query}&force=1` — mints a signed `_` token for the API call and returns the current `cf_clearance`, `waf_pass` and `user_agent` to use with it.
