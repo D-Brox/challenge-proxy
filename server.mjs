@@ -11,7 +11,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { loadMaterial, generateUnderscore, decryptE } from './lib/cipher.js';
 import { ensureCookies, getCfClearance } from './lib/waf.js';
-import { extractAndSaveMaterial, reloadMaterial } from './lib/refresh.js';
+import { extractAndSaveMaterial, loadOrExtractMaterial } from './lib/refresh.js';
 
 const PORT = Number(process.env.PORT || 9191);
 const REFRESH_TOKEN = process.env.REFRESH_TOKEN || '';
@@ -65,9 +65,9 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { material });
     }
 
-    if (u.pathname === '/reload-material' && req.method === 'POST') {
-      const material = reloadMaterial();
-      return send(res, 200, { material });
+    if (u.pathname === '/load-material' && req.method === 'POST') {
+      const status = await loadOrExtractMaterial();
+      return send(res, status.ok ? 200 : 500, status);
     }
 
     if (u.pathname === '/health' && req.method === 'GET') {
@@ -91,7 +91,7 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/' || u.pathname === '') {
       return send(res, 200, {
-        endpoints: ['/sign', '/decrypt', '/cookies', '/material', '/refresh-material', '/reload-material', '/health'],
+        endpoints: ['/sign', '/decrypt', '/cookies', '/material', '/refresh-material', '/load-material', '/health'],
       });
     }
 
@@ -102,7 +102,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  const mat = loadMaterial();
   console.log(`comix-proxy listening on :${PORT}`);
-  console.log(`material: sboxes=${mat.sboxes.map((s) => s.length).join('/')} keys=${mat.keys.map((k) => k.length).join('/')}`);
+  try {
+    const mat = loadMaterial();
+    console.log(`material: sboxes=${mat.sboxes.map((s) => s.length).join('/')} keys=${mat.keys.map((k) => k.length).join('/')}`);
+  } catch (e) {
+    console.log(`material: not yet extracted (call POST /load-material to bootstrap)`);
+  }
 });
