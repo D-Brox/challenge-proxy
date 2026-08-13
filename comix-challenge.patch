@@ -1,0 +1,1047 @@
+diff --git a/src/en/comix/build.gradle.kts b/src/en/comix/build.gradle.kts
+index 85c6d8458..5621a43ed 100644
+--- a/src/en/comix/build.gradle.kts
++++ b/src/en/comix/build.gradle.kts
+@@ -6,7 +6,7 @@ plugins {
+ 
+ keiyoushi {
+     name = "Comix"
+-    versionCode = 34
++    versionCode = 35
+     contentWarning = ContentWarning.MIXED
+     libVersion = "1.4"
+ 
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
+index ad0975942..5da30f9aa 100644
+--- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
+@@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
+ 
+ import android.annotation.SuppressLint
+ import android.content.SharedPreferences
++import android.graphics.BitmapFactory
+ import android.os.Handler
+ import android.os.Looper
++import android.util.Base64
+ import android.view.View
+ import android.view.ViewGroup
+ import android.webkit.CookieManager
+@@ -18,6 +20,7 @@ import androidx.preference.MultiSelectListPreference
+ import androidx.preference.PreferenceScreen
+ import androidx.preference.SwitchPreferenceCompat
+ import eu.kanade.tachiyomi.network.GET
++import eu.kanade.tachiyomi.network.POST
+ import eu.kanade.tachiyomi.network.awaitSuccess
+ import eu.kanade.tachiyomi.source.ConfigurableSource
+ import eu.kanade.tachiyomi.source.model.FilterList
+@@ -33,8 +36,12 @@ import keiyoushi.utils.applicationContext
+ import keiyoushi.utils.firstInstanceOrNull
+ import keiyoushi.utils.getPreferencesLazy
+ import keiyoushi.utils.parseAs
++import keiyoushi.utils.toJsonRequestBody
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import okhttp3.Cookie
++import okhttp3.CookieJar
+ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+@@ -44,6 +51,7 @@ import okio.Buffer
+ import org.json.JSONObject
+ import org.jsoup.nodes.Document
+ import rx.Observable
++import java.net.URLEncoder
+ import java.util.concurrent.Semaphore
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -62,6 +70,10 @@ abstract class Comix :
+     private val preferences: SharedPreferences by getPreferencesLazy()
+ 
+     override val client = network.client.newBuilder()
++        .cookieJar(object : CookieJar {
++            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) = Unit
++            override fun loadForRequest(url: HttpUrl): List<Cookie> = emptyList()
++        })
+         .addInterceptor(Descrambler.interceptor)
+         .addInterceptor { chain ->
+             val request = chain.request()
+@@ -91,9 +103,235 @@ abstract class Comix :
+         .add("Referer", "$baseUrl/")
+         .add("Origin", baseUrl)
+         .add("Accept", "*/*")
++        .apply {
++            val proxy = proxyServer()
++            if (proxy != null) {
++                storedProxyCookie()?.let { add("Cookie", it) }
++                storedProxyUserAgent()?.let { set("User-Agent", it) }
++            } else {
++                storedWafCookie()?.let { add("Cookie", it) }
++            }
++        }
+ 
+     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+ 
++    // ============================== WAF ==============================
++    // The site serves a rotate-to-align captcha before trusting a client. The
++    // "main" image is a circle at the correct orientation and the "thumb" is its
++    // rotated center sub-image; the server accepts the clockwise angle that fixes
++    // the thumb and answers with a `waf_pass` cookie that all requests must carry.
++    private var cachedWafCookie: String? = null
++
++    private fun storedWafCookie(): String? {
++        cachedWafCookie?.let { return it }
++        return preferences.getString(PREF_WAF_COOKIE, null)?.also { cachedWafCookie = it }
++    }
++
++    private fun saveWafCookie(cookie: String?) {
++        cachedWafCookie = cookie
++        preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
++    }
++
++    // ============================== Proxy ==============================
++    // When a comix-proxy server is configured, the extension offloads both the
++    // cipher material and the WAF/Cloudflare cookies to it. The proxy mints the
++    // `_` token, solves the site's rotate captcha (`waf_pass`) and Cloudflare
++    // (`cf_clearance`) via FlareSolverr, and returns the UA it solved with
++    // (cf_clearance is UA-bound, so the extension must echo it). Everything is
++    // fetched through the cleared client and cached here.
++    private var cachedProxyCookie: String? = null
++    private var cachedProxyUserAgent: String? = null
++
++    private fun proxyServer(): String? = preferences.getString(PREF_PROXY_SERVER, null)
++        ?.trim()
++        ?.takeIf { it.isNotBlank() }
++
++    private fun storedProxyCookie(): String? {
++        cachedProxyCookie?.let { return it }
++        return preferences.getString(PREF_PROXY_COOKIE, null)?.also { cachedProxyCookie = it }
++    }
++
++    private fun storedProxyUserAgent(): String? {
++        cachedProxyUserAgent?.let { return it }
++        return preferences.getString(PREF_PROXY_USER_AGENT, null)?.also { cachedProxyUserAgent = it }
++    }
++
++    private fun saveProxySession(sign: ProxySignResponse) {
++        val cookie = "cf_clearance=${sign.cfClearance}; waf_pass=${sign.wafPass}"
++        cachedProxyCookie = cookie
++        cachedProxyUserAgent = sign.userAgent
++        preferences.edit()
++            .putString(PREF_PROXY_COOKIE, cookie)
++            .putString(PREF_PROXY_USER_AGENT, sign.userAgent)
++            .apply()
++        runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
++    }
++
++    /**
++     * Calls `{proxy}/sign` for the signed [path] with canonicalized [params] and
++     * returns the minted token plus the proxy's current cookies/UA. The qs is
++     * the canonical (raw-bracket) form the site's serializer produces; the proxy
++     * mints the token over it and the URL is later rebuilt with the same sorted
++     * params, so ordering matches what the server validates.
++     */
++    private fun proxySign(
++        proxy: String,
++        path: String,
++        params: Map<String, List<String>>,
++        forceRefresh: Boolean = false,
++    ): ProxySignResponse? {
++        val qs = ComixCrypto.canonicalizes(params)
++        val url = proxy.trimEnd('/') +
++            "/sign?path=" + URLEncoder.encode(path, "UTF-8") +
++            "&qs=" + URLEncoder.encode(qs, "UTF-8") +
++            if (forceRefresh) "&force=1" else ""
++        return runCatching {
++            client.newCall(GET(url, headers)).execute().use { resp ->
++                if (!resp.isSuccessful) {
++                    null
++                } else {
++                    resp.parseAs<ProxySignResponse>()
++                }
++            }
++        }.getOrNull()?.also { saveProxySession(it) }
++    }
++
++    /** Fetches the proxy's current cipher material (`/material`, `{s:[],k:[]}`). */
++    private fun proxyMaterial(proxy: String): ComixMaterial? {
++        val url = proxy.trimEnd('/') + "/material"
++        return runCatching {
++            client.newCall(GET(url, headers)).execute().use { resp ->
++                if (!resp.isSuccessful) {
++                    null
++                } else {
++                    resp.body.string().let { ComixMaterial.tryFromJson(it) }
++                }
++            }
++        }.getOrNull()
++    }
++
++    /** Tells the proxy to re-extract material from the live site. */
++    private fun refreshProxyMaterial(proxy: String) {
++        runCatching {
++            client.newCall(POST(proxy.trimEnd('/') + "/refresh-material")).execute().close()
++        }
++    }
++
++    /**
++     * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
++     * is set (e.g. a request just came back as the challenge page) or none is
++     * stored yet. The WebView needs the cookie too, so it is mirrored into the
++     * WebView cookie store.
++     */
++    @Synchronized
++    private fun obtainWafCookie(forceRefresh: Boolean): String? {
++        if (!forceRefresh) {
++            storedWafCookie()?.let { return it }
++        }
++        repeat(WAF_MAX_ATTEMPTS) {
++            trySolveWafChallenge()?.let { cookie ->
++                saveWafCookie(cookie)
++                runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
++                return cookie
++            }
++        }
++        saveWafCookie(null)
++        return null
++    }
++
++    private fun trySolveWafChallenge(): String? {
++        val url = "$baseUrl/@waf/generate"
++        val apiHeaders = headersBuilder()
++            .removeAll("Cookie")
++            .set("Accept", "application/json")
++            .build()
++        return try {
++            val challenge = client.newCall(GET(url, apiHeaders))
++                .execute()
++                .use { it.parseAs<WafChallengeResponse>() }
++            val original = decodeDataUri(challenge.imageBase64)
++            val rotatedCrop = decodeDataUri(challenge.thumbBase64)
++            if (original == null || rotatedCrop == null) {
++                original?.recycle()
++                rotatedCrop?.recycle()
++                return null
++            }
++            try {
++                val angle = RotationEstimator.estimateRotationAngle(original, rotatedCrop)
++                val verify = POST(
++                    "$baseUrl/@waf/verify",
++                    apiHeaders,
++                    WafVerifyRequest(challenge.captchaId, angle % 360).toJsonRequestBody(),
++                )
++                client.newCall(verify).execute().use { response ->
++                    val cookie = response.headers("Set-Cookie")
++                        .firstOrNull { it.startsWith("waf_pass=") }
++                        ?.substringBefore(";")
++                    val success = response.parseAs<WafVerifyResponse>().success
++                    if (success) cookie else null
++                }
++            } finally {
++                original.recycle()
++                rotatedCrop.recycle()
++            }
++        } catch (e: Exception) {
++            null
++        }
++    }
++
++    private fun decodeDataUri(uri: String): android.graphics.Bitmap? = runCatching {
++        val bytes = Base64.decode(uri.substringAfter(','), Base64.DEFAULT)
++        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
++    }.getOrNull()
++
++    /**
++     * Fetches a page HTML, transparently refreshing the WAF cookie and retrying
++     * once when the server answers with the rotate captcha page instead. In proxy
++     * mode the refresh goes through the proxy (`/cookies?force=1`) which solves
++     * Cloudflare + the site captcha remotely.
++     */
++    private suspend fun fetchPage(url: String): Document {
++        val document = client.newCall(GET(url, headers)).awaitSuccess().asJsoup()
++        if (!document.isWafChallenge()) return document
++        refreshCookiesOrWaf()
++        val retry = client.newCall(GET(url, headers)).awaitSuccess().asJsoup()
++        if (retry.isWafChallenge()) {
++            throw Exception("WAF challenge could not be solved")
++        }
++        return retry
++    }
++
++    /**
++     * Refreshes the current WAF session: asks the proxy to re-solve cookies
++     * (`/cookies?force=1`) when a proxy is configured, otherwise solves the
++     * site's rotate captcha natively.
++     */
++    private fun refreshCookiesOrWaf() {
++        val proxy = proxyServer()
++        if (proxy == null) {
++            obtainWafCookie(forceRefresh = true)
++            return
++        }
++        val cookies = runCatching {
++            client.newCall(GET(proxy.trimEnd('/') + "/cookies?force=1", headers)).execute().use { resp ->
++                if (resp.isSuccessful) resp.parseAs<ProxyCookiesResponse>() else null
++            }
++        }.getOrNull()
++        if (cookies != null) {
++            saveProxySession(
++                ProxySignResponse(
++                    token = "",
++                    wafPass = cookies.wafPass,
++                    cfClearance = cookies.cfClearance,
++                    userAgent = cookies.userAgent,
++                ),
++            )
++        }
++    }
++
++    private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
++        selectFirst("#stage") != null
++
+     // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
+     // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
+     override fun imageRequest(page: Page): Request {
+@@ -137,8 +375,13 @@ abstract class Comix :
+     )
+ 
+     private fun fetchMangaListFromBrowse(request: Request): Observable<MangasPage> = Observable.fromCallable {
++        nativeMangaList(request)
++            ?: webViewMangaListFromBrowse(request)
++    }
++
++    private fun webViewMangaListFromBrowse(request: Request): MangasPage {
+         val document = runBlocking {
+-            client.newCall(request).awaitSuccess().asJsoup()
++            fetchPage(request.url.toString())
+         }
+         val contentRating = request.url.queryParameter("content_rating")
+             ?: preferences.contentRating()
+@@ -270,7 +513,7 @@ abstract class Comix :
+         val mangaList = searchResponse.result.items.map {
+             it.toBasicSManga(preferences.posterQuality())
+         }
+-        MangasPage(mangaList, searchResponse.result.hasNextPage())
++        return MangasPage(mangaList, searchResponse.result.hasNextPage())
+     }
+ 
+     private fun Document.extractBrowseResponse(): SearchResponse? {
+@@ -489,7 +732,7 @@ abstract class Comix :
+ 
+     override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
+         val document = runBlocking {
+-            client.newCall(GET(getMangaUrl(manga), headers)).awaitSuccess().asJsoup()
++            fetchPage(getMangaUrl(manga))
+         }
+ 
+         val initialData = document.selectFirst("script#initial-data")?.data()
+@@ -516,12 +759,14 @@ abstract class Comix :
+     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
+ 
+     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
+-        val deduplicate = preferences.deduplicateChapters()
+-        val blacklist = preferences.scanlatorBlacklist()
++        nativeChapterList(manga) ?: webViewChapterList(manga)
++    }
++
++    private fun webViewChapterList(manga: SManga): List<SChapter> {
+         val mangaSlug = manga.url.removePrefix("/")
+ 
+         val document = runBlocking {
+-            client.newCall(GET(getMangaUrl(manga), headers)).awaitSuccess().asJsoup()
++            fetchPage(getMangaUrl(manga))
+         }
+         val payload = runInWebView(
+             document = document,
+@@ -620,34 +865,8 @@ abstract class Comix :
+             },
+         )
+ 
+-        val allChapters = payload.parseAs<List<Chapter>>()
+-
+-        // Filter out groups specified in the blacklist first
+-        val filteredChapters = if (blacklist.isNotEmpty()) {
+-            allChapters.filter { ch ->
+-                val scanlatorName = when {
+-                    ch.group != null -> ch.group.name
+-                    ch.isOfficial -> "Official"
+-                    else -> "Unknown"
+-                }
+-                val nameNormalized = scanlatorName.trim().lowercase()
+-                val idStr = ch.group?.id?.toString()
+-
+-                nameNormalized !in blacklist && idStr !in blacklist
+-            }
+-        } else {
+-            allChapters
+-        }
+-
+-        val finalChapters: List<Chapter> = if (deduplicate) {
+-            val chapterMap = LinkedHashMap<Number, Chapter>()
+-            deduplicateChapters(chapterMap, filteredChapters)
+-            chapterMap.values.toList()
+-        } else {
+-            filteredChapters
+-        }
+-
+-        finalChapters.map { it.toSChapter(mangaSlug) }
++        val chapters = buildChapters(payload.parseAs<List<Chapter>>(), mangaSlug)
++        return chapters
+     }
+ 
+     override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
+@@ -685,11 +904,43 @@ abstract class Comix :
+         }
+     }
+ 
++    private fun buildChapters(allChapters: List<Chapter>, mangaSlug: String): List<SChapter> {
++        val blacklist = preferences.scanlatorBlacklist()
++        val filteredChapters = if (blacklist.isNotEmpty()) {
++            allChapters.filter { ch ->
++                val scanlatorName = when {
++                    ch.group != null -> ch.group.name
++                    ch.isOfficial -> "Official"
++                    else -> "Unknown"
++                }
++                val nameNormalized = scanlatorName.trim().lowercase()
++                val idStr = ch.group?.id?.toString()
++
++                nameNormalized !in blacklist && idStr !in blacklist
++            }
++        } else {
++            allChapters
++        }
++
++        val finalChapters: List<Chapter> = if (preferences.deduplicateChapters()) {
++            val chapterMap = LinkedHashMap<Number, Chapter>()
++            deduplicateChapters(chapterMap, filteredChapters)
++            chapterMap.values.toList()
++        } else {
++            filteredChapters
++        }
++
++        return finalChapters.map { it.toSChapter(mangaSlug) }
++    }
++
+     // =============================== Pages ===============================
+     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
+-        val request = GET(getChapterUrl(chapter), headers)
++        nativePageList(chapter) ?: webViewPageList(chapter)
++    }
++
++    private fun webViewPageList(chapter: SChapter): List<Page> {
+         val document = runBlocking {
+-            client.newCall(request).awaitSuccess().asJsoup()
++            fetchPage(getChapterUrl(chapter))
+         }
+         val payload = runInWebView(
+             document = document,
+@@ -734,10 +985,15 @@ abstract class Comix :
+             },
+         )
+ 
+-        val pages = payload.parseAs<ChapterResponse>().result.pages
++        val pages = buildPages(payload.parseAs<ChapterResponse>())
++        return pages
++    }
++
++    private fun buildPages(payload: ChapterResponse): List<Page> {
++        val pages = payload.result.pages
+         val base = pages.baseUrl.trimEnd('/')
+ 
+-        pages.items.mapIndexed { index, img ->
++        return pages.items.mapIndexed { index, img ->
+             val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
+             // V3 pages need the query flag so the server returns grid-scramble headers.
+             // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
+@@ -756,6 +1012,211 @@ abstract class Comix :
+         }
+     }
+ 
++    // ====================== Native signed API =========================
++    // The /api/v1/* endpoints require every request to carry a `_` token minted
++    // with the site's live cipher material (see ComixMaterial), which comes from
++    // the proxy server; responses are plaintext JSON. Native calls are a cheap
++    // alternative to booting the SPA in a WebView; a signature rejection means
++    // the site rotated its material, so the cache is dropped, the material is
++    // re-fetched from the proxy, and the call retried once before falling back
++    // to the WebView path.
++
++    private class CipherRotatedException(message: String) : Exception(message)
++
++    private fun cachedMaterial(): ComixMaterial? = preferences.getString(PREF_CIPHER_MATERIAL, null)
++        ?.let { ComixMaterial.tryFromJson(it) }
++
++    private fun cacheMaterial(material: ComixMaterial) {
++        preferences.edit().putString(PREF_CIPHER_MATERIAL, material.toJsonString()).apply()
++    }
++
++    private fun clearCachedMaterial() {
++        preferences.edit().remove(PREF_CIPHER_MATERIAL).apply()
++    }
++
++    /**
++     * Runs [block] with the cached (or freshly fetched) cipher, persisting the
++     * material only after it produced a valid response. A signature rejection
++     * (the site rotated its material) clears the cache, re-fetches once, and
++     * retries; any other failure returns null so callers fall back to WebView.
++     *
++     * Material always comes from the proxy server: the extension no longer
++     * extracts the cipher bundles itself, and a rotation triggers a proxy-side
++     * re-extraction.
++     */
++    private fun <T> withCipher(block: (ComixCipher) -> T): T? {
++        val proxy = proxyServer() ?: return null
++        var material = cachedMaterial()
++        if (material == null) {
++            material = proxyMaterial(proxy)
++        }
++        if (material == null) {
++            return null
++        }
++
++        try {
++            val result = block(material.toCipher())
++            cacheMaterial(material)
++            return result
++        } catch (e: CipherRotatedException) {
++            clearCachedMaterial()
++            refreshProxyMaterial(proxy)
++            val fresh = proxyMaterial(proxy) ?: return null
++            val result = try {
++                block(fresh.toCipher())
++            } catch (e2: Exception) {
++                null
++            }
++            if (result != null) {
++                cacheMaterial(fresh)
++            }
++            return result
++        } catch (e: Exception) {
++            return null
++        }
++    }
++
++    /** The /api/v1/manga request mirrors the browse URL params. */
++    private fun nativeMangaParams(url: HttpUrl): LinkedHashMap<String, List<String>> {
++        val params = LinkedHashMap<String, List<String>>()
++        for (name in url.queryParameterNames) {
++            val values = url.queryParameterValues(name).filterNotNull()
++            if (values.isNotEmpty()) params[name] = values
++        }
++        if ("limit" !in params) params["limit"] = listOf("28")
++        return params
++    }
++
++    /**
++     * Executes a signed native API call, minting the token via the proxy's
++     * `/sign` endpoint and retrying once with a forced cookie refresh when the
++     * server answers with a `captcha_required` challenge.
++     */
++    private fun executeSigned(path: String, params: Map<String, List<String>>): Response {
++        val proxy = proxyServer() ?: throw Exception("Proxy server not configured")
++        return executeSignedViaProxy(proxy, path, params)
++    }
++
++    /**
++     * Proxy-backed [executeSigned]: mints the token via `/sign`, builds the URL
++     * with the same canonical param ordering, and retries once with a forced
++     * cookie refresh when the server answers with a challenge.
++     */
++    private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
++        val sign = proxySign(proxy, path, params)
++            ?: throw Exception("Proxy sign failed")
++        var response = client.newCall(signedRequest(path, params, sign.token)).execute()
++        if (response.isApiChallenge()) {
++            response.close()
++            val refreshed = proxySign(proxy, path, params, forceRefresh = true)
++                ?: throw Exception("Proxy sign refresh failed")
++            response = client.newCall(signedRequest(path, params, refreshed.token)).execute()
++        }
++        return response
++    }
++
++    private fun Response.isApiChallenge(): Boolean {
++        if (isSuccessful) return false
++        if (code == 401) return false
++        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
++        return body.contains("captcha_required") ||
++            body.contains("Security check") ||
++            body.contains("id=\"stage\"") ||
++            body.contains("Just a moment") ||
++            body.contains("cf-chl") ||
++            body.contains("<html", ignoreCase = true)
++    }
++
++    /** Builds the signed request using a pre-minted [token]. */
++    private fun signedRequest(
++        path: String,
++        params: Map<String, List<String>>,
++        token: String,
++    ): Request {
++        val builder = baseUrl.toHttpUrl().newBuilder()
++            .addPathSegments(path.trimStart('/'))
++        params.entries
++            .sortedBy { it.key }
++            .forEach { (key, values) ->
++                if (values.size == 1) {
++                    builder.addQueryParameter(key, values[0])
++                } else {
++                    values.forEachIndexed { i, v -> builder.addQueryParameter("$key[$i]", v) }
++                }
++            }
++        builder.addQueryParameter("_", token)
++        return GET(builder.build(), headers)
++    }
++
++    private fun responseBodyOrThrow(response: Response, cipher: ComixCipher): String {
++        val body = response.body.string()
++        response.close()
++        if (response.code == 403 &&
++            (
++                body.contains("Invalid token", ignoreCase = true) ||
++                    body.contains("Missing token", ignoreCase = true)
++                )
++        ) {
++            throw CipherRotatedException(body.take(160))
++        }
++        if (!response.isSuccessful) {
++            throw Exception("API returned ${response.code}")
++        }
++        return decodeSignal(body, cipher)
++    }
++
++    /** Passes plaintext responses through; decrypts an `"e"` envelope if present. */
++    private fun decodeSignal(body: String, cipher: ComixCipher): String {
++        val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
++            ?: return body
++        val e = root["e"] as? JsonPrimitive ?: return body
++        val decrypted = String(cipher.decryptE(e.content), Charsets.UTF_8)
++        val parsed = runCatching { decrypted.parseAs<JsonObject>() }.getOrNull()
++        if (parsed == null) {
++            throw CipherRotatedException(decrypted.take(160))
++        }
++        return decrypted
++    }
++
++    private fun nativeMangaList(request: Request): MangasPage? = withCipher { cipher ->
++        val response = executeSigned("/api/v1/manga", nativeMangaParams(request.url))
++        val items = responseBodyOrThrow(response, cipher).parseAs<SearchResponse>().result
++        MangasPage(
++            items.items.map { it.toBasicSManga(preferences.posterQuality()) },
++            items.hasNextPage(),
++        )
++    }
++
++    private fun nativeChapterList(manga: SManga): List<SChapter>? {
++        val mangaSlug = manga.url.removePrefix("/")
++        val hid = mangaSlug.substringBefore("-").takeIf { it.isNotBlank() } ?: return null
++        return withCipher { cipher ->
++            val allChapters = mutableListOf<Chapter>()
++            var page = 1
++            while (page <= NATIVE_MAX_CHAPTER_PAGES) {
++                val params = linkedMapOf(
++                    "page" to listOf(page.toString()),
++                    "limit" to listOf("20"),
++                    "order[number]" to listOf("desc"),
++                )
++                val response = executeSigned("/api/v1/manga/$hid/chapters", params)
++                val result = responseBodyOrThrow(response, cipher).parseAs<ChapterDetailsResponse>().result
++                allChapters += result.items
++                if (!result.hasNextPage() || result.items.isEmpty()) break
++                page++
++            }
++            buildChapters(allChapters, mangaSlug)
++        }
++    }
++
++    private fun nativePageList(chapter: SChapter): List<Page>? {
++        val cid = PAGE_ID_REGEX.find(chapter.url)?.groupValues?.get(1) ?: return null
++        return withCipher { cipher ->
++            val response = executeSigned("/api/v1/chapters/$cid", emptyMap())
++            buildPages(responseBodyOrThrow(response, cipher).parseAs<ChapterResponse>())
++        }
++    }
++
+     override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
+ 
+     override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
+@@ -812,6 +1273,7 @@ abstract class Comix :
+                 CookieManager.getInstance().apply {
+                     setAcceptCookie(true)
+                     setAcceptThirdPartyCookies(view, true)
++                    storedWafCookie()?.let { setCookie(baseUrl, it) }
+                 }
+ 
+                 view.addJavascriptInterface(payloadResult, interfaceName)
+@@ -905,7 +1367,11 @@ abstract class Comix :
+         if (!completed) {
+             throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
+         }
+-        return payloadResult.payload ?: throw Exception("Failed to capture WebView payload")
++        val payload = payloadResult.payload
++        if (payload == null) {
++            throw Exception("Failed to capture WebView payload")
++        }
++        return payload
+     }
+ 
+     private class WebViewPayloadResult {
+@@ -940,6 +1406,16 @@ abstract class Comix :
+ 
+     // ============================= Settings =============================
+     override fun setupPreferenceScreen(screen: PreferenceScreen) {
++        EditTextPreference(screen.context).apply {
++            key = PREF_PROXY_SERVER
++            title = "Proxy server (comix-proxy)"
++            summary = "Base URL of a comix-proxy instance that mints signed tokens " +
++                "and solves the site's WAF/Cloudflare challenges (e.g. " +
++                "http://192.168.1.10:9191). Leave empty to use the built-in solver."
++            dialogTitle = "Proxy server URL"
++            setDefaultValue("")
++        }.let(screen::addPreference)
++
+         ListPreference(screen.context).apply {
+             key = PREF_POSTER_QUALITY
+             title = "Thumbnail Quality"
+@@ -1107,14 +1583,24 @@ abstract class Comix :
+         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
+         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
+         private const val PREF_SCORE_POSITION = "pref_score_position"
++        private const val PREF_WAF_COOKIE = "pref_waf_cookie"
++        private const val PREF_CIPHER_MATERIAL = "pref_cipher_material"
++        private const val PREF_PROXY_SERVER = "pref_proxy_server"
++        private const val PREF_PROXY_COOKIE = "pref_proxy_cookie"
++        private const val PREF_PROXY_USER_AGENT = "pref_proxy_user_agent"
+ 
+         private const val DEFAULT_CONTENT_RATING = "suggestive"
++        private const val WAF_MAX_ATTEMPTS = 3
++        private const val NATIVE_MAX_CHAPTER_PAGES = 200
+         private const val WEBVIEW_START_TIMEOUT_SECONDS = 120L
+         private const val WEBVIEW_TIMEOUT_SECONDS = 90L
+         private const val SCRIPT_RETRY_INTERVAL_MS = 100L
+         private const val WEBVIEW_WIDTH = 1080
+         private const val WEBVIEW_HEIGHT = 1920
++        private const val CHALLENGE_PEEK_BYTES = 2048L
++        private val HEX = "0123456789ABCDEF".toCharArray()
+         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
++        private val PAGE_ID_REGEX = Regex("""/(\d+)-chapter-""")
+         private val CHAPTER_NUM_REGEX = Regex("""Ch\.([\d.]+)""")
+         private val GROUP_ID_REGEX = Regex("""/groups/(\d+)""")
+         private val CHAPTER_ID_REGEX = Regex("""/(\d+)-""")
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt
+new file mode 100644
+index 000000000..4cead5355
+--- /dev/null
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Crypto.kt
+@@ -0,0 +1,151 @@
++package eu.kanade.tachiyomi.extension.en.comix
++
++import android.util.Base64
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * The site's live cipher material: three 256-byte S-boxes and the three keys
++ * (24/24/32 bytes). Fetched from the proxy server, cached in preferences, and
++ * re-fetched when the site rotates it -- it is never embedded in source.
++ */
++internal class ComixMaterial(
++    val sboxes: List<IntArray>,
++    val keys: List<IntArray>,
++) {
++
++    fun toCipher(): ComixCipher = ComixCipher(sboxes.toTypedArray(), keys.toTypedArray())
++
++    fun toJsonString(): String = JSONObject().apply {
++        put("s", JSONArray().apply { sboxes.forEach { put(bytesToBase64(it)) } })
++        put("k", JSONArray().apply { keys.forEach { put(bytesToBase64(it)) } })
++    }.toString()
++
++    companion object {
++        private const val COUNT = 3
++
++        fun tryFromJson(json: String?): ComixMaterial? {
++            if (json.isNullOrBlank()) return null
++            val root = runCatching { JSONObject(json) }.getOrNull() ?: return null
++            val sboxes = decodeBlobs(root.optJSONArray("s")) ?: return null
++            val keys = decodeBlobs(root.optJSONArray("k")) ?: return null
++            if (sboxes.size != COUNT || keys.size != COUNT) return null
++            if (sboxes.any { it.size != 256 || !it.isPermutation256() }) return null
++            if (keys.any { it.size != 24 && it.size != 32 }) return null
++            return ComixMaterial(sboxes, keys)
++        }
++
++        private fun decodeBlobs(array: JSONArray?): List<IntArray>? = buildList {
++            if (array == null) return null
++            for (i in 0 until array.length()) {
++                val bytes = runCatching { Base64.decode(array.getString(i), Base64.DEFAULT) }.getOrNull()
++                    ?: return null
++                add(IntArray(bytes.size) { bytes[it].toInt() and 0xFF })
++            }
++        }
++
++        private fun bytesToBase64(bytes: IntArray): String = Base64.encodeToString(ByteArray(bytes.size) { bytes[it].toByte() }, Base64.NO_WRAP)
++    }
++}
++
++internal fun IntArray.isPermutation256(): Boolean {
++    if (size != 256) return false
++    val seen = BooleanArray(256)
++    for (v in this) {
++        if (v < 0 || v > 255 || seen[v]) return false
++        seen[v] = true
++    }
++    return true
++}
++
++/**
++ * Pure-Kotlin port of the site's request-signing cipher: three CBC-ish S-box
++ * rounds over [0,255] bytes. The S-boxes and keys are the site's cipher
++ * material -- fetched from the proxy server (see [ComixMaterial]), never
++ * embedded in source. Only the per-round chaining seeds are literal site
++ * constants.
++ */
++internal object ComixCrypto {
++
++    /**
++     * Builds the canonical, sorted, indexed query string exactly like the
++     * site's `Z0` serializer: keys sorted, list values expanded to
++     * `key[i]=value`, single values emitted as `key=value`, values
++     * URL-encoded like JS `encodeURIComponent`.
++     */
++    fun canonicalizes(params: Map<String, List<String>>): String {
++        val parts = buildList {
++            for (key in params.keys.sorted()) {
++                val entry = params.getValue(key)
++                if (entry.size == 1) {
++                    add("$key=${encodeURIComponent(entry[0])}")
++                } else {
++                    entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
++                }
++            }
++        }
++        return parts.joinToString("&")
++    }
++
++    /** JS `encodeURIComponent`: unreserved chars pass through, everything else %-escaped UTF-8. */
++    fun encodeURIComponent(value: String): String {
++        val out = StringBuilder()
++        for (b in value.toByteArray(Charsets.UTF_8)) {
++            val c = b.toInt() and 0xFF
++            if (
++                (c in 'A'.code..'Z'.code) || (c in 'a'.code..'z'.code) || (c in '0'.code..'9'.code) ||
++                c == '-'.code || c == '_'.code || c == '.'.code || c == '!'.code ||
++                c == '~'.code || c == '*'.code || c == '\''.code || c == '('.code || c == ')'.code
++            ) {
++                out.append(c.toChar())
++            } else {
++                out.append('%').append(HEX[(c ushr 4) and 0xF]).append(HEX[c and 0xF])
++            }
++        }
++        return out.toString()
++    }
++
++    private val HEX = "0123456789ABCDEF"
++}
++
++internal class ComixCipher(
++    private val sboxes: Array<IntArray>,
++    private val keys: Array<IntArray>,
++) {
++    init {
++        require(sboxes.size == 3) { "Expected 3 sboxes, got ${sboxes.size}" }
++        require(keys.size == 3) { "Expected 3 keys, got ${keys.size}" }
++        require(sboxes.all { it.size == 256 }) { "S-boxes must be 256 bytes" }
++        require(keys.all { it.size == 24 || it.size == 32 }) { "Keys must be 24 or 32 bytes" }
++    }
++
++    private val preves = intArrayOf(189, 133, 32)
++
++    /** Decrypts an `"e"` envelope field (inverse rounds 3->2->1) to raw JSON bytes. */
++    fun decryptE(e: String): ByteArray {
++        val raw = base64UrlDecode(e)
++        val step2 = subRoundInv(raw, sboxes[2], keys[2], preves[2])
++        val step1 = subRoundInv(step2, sboxes[1], keys[1], preves[1])
++        return subRoundInv(step1, sboxes[0], keys[0], preves[0])
++    }
++
++    private fun subRoundInv(data: ByteArray, sbox: IntArray, key: IntArray, prev: Int): ByteArray {
++        val inv = IntArray(256)
++        for (i in 0..255) inv[sbox[i] and 0xFF] = i
++        val out = ByteArray(data.size)
++        var p = prev
++        for (i in data.indices) {
++            val b = data[i].toInt() and 0xFF
++            val idx = inv[b]
++            out[i] = (idx xor key[i % key.size] xor p).toByte()
++            p = b
++        }
++        return out
++    }
++
++    private fun base64UrlDecode(s: String): ByteArray {
++        val fixed = s.replace('-', '+').replace('_', '/')
++        val padded = fixed + "=".repeat((4 - fixed.length % 4) % 4)
++        return Base64.decode(padded, Base64.DEFAULT)
++    }
++}
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
+index 8f69de428..a9886c638 100644
+--- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
+@@ -8,6 +8,24 @@ import java.math.BigDecimal
+ import java.math.RoundingMode
+ import java.util.Calendar
+ 
++@Serializable
++class WafChallengeResponse(
++    @SerialName("captcha_id") val captchaId: String,
++    @SerialName("image_base64") val imageBase64: String,
++    @SerialName("thumb_base64") val thumbBase64: String,
++)
++
++@Serializable
++class WafVerifyRequest(
++    @SerialName("captcha_id") val captchaId: String,
++    val angle: Int,
++)
++
++@Serializable
++class WafVerifyResponse(
++    val success: Boolean,
++)
++
+ @Serializable
+ class Term(
+     val title: String,
+@@ -329,3 +347,20 @@ class ChapterResponse(
+         val s: Int = 0,
+     )
+ }
++
++/** Response of the comix-proxy `/sign` endpoint. */
++@Serializable
++class ProxySignResponse(
++    val token: String,
++    @SerialName("waf_pass") val wafPass: String,
++    @SerialName("cf_clearance") val cfClearance: String,
++    @SerialName("user_agent") val userAgent: String,
++)
++
++/** Response of the comix-proxy `/cookies` endpoint. */
++@Serializable
++class ProxyCookiesResponse(
++    @SerialName("waf_pass") val wafPass: String,
++    @SerialName("cf_clearance") val cfClearance: String,
++    @SerialName("user_agent") val userAgent: String,
++)
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt
+new file mode 100644
+index 000000000..37417acaf
+--- /dev/null
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt
+@@ -0,0 +1,103 @@
++package eu.kanade.tachiyomi.extension.en.comix
++
++import android.graphics.Bitmap
++import kotlin.math.PI
++import kotlin.math.cos
++import kotlin.math.floor
++import kotlin.math.sin
++
++/**
++ * Recovers the clockwise angle by which a centered square crop was rotated.
++ *
++ * `rotatedCrop` is the central `size×size` region of `original`, rotated around
++ * its center so that pixels with no source data became transparent. The
++ * reference is the same central region read straight from `original`, so only
++ * the rotation angle needs to be estimated.
++ *
++ * Scoring samples `rotatedCrop` at the back-rotated coordinates of each
++ * reference pixel (bilinear interpolation) and accumulates mean-squared error
++ * over pixels that are both in-bounds and opaque. Out-of-bounds and transparent
++ * samples are skipped entirely - the transparent corner wedges are invalid data,
++ * not black. Normalizing by the valid pixel count keeps the metric comparable
++ * across angles that expose different amounts of valid area.
++ *
++ * A 1-degree scan on a downsampled grid locates the peak cheaply; the returned
++ * angle is the integer degree (0-359) the server expects. The whole search
++ * reuses a single set of pixel buffers; no rotated bitmap is allocated per
++ * angle.
++ */
++object RotationEstimator {
++
++    private const val ALPHA_THRESHOLD = 128f
++    private const val COARSE_GRID = 128
++    private const val MIN_VALID_PIXELS = 100
++
++    fun estimateRotationAngle(original: Bitmap, rotatedCrop: Bitmap): Int {
++        val size = rotatedCrop.width
++        val total = size * size
++        val offset = (original.width - size) / 2
++
++        val refGray = FloatArray(total)
++        val rotGray = FloatArray(total)
++        val rotAlpha = FloatArray(total)
++
++        val refPixels = IntArray(total)
++        val rotPixels = IntArray(total)
++        original.getPixels(refPixels, 0, size, offset, offset, size, size)
++        rotatedCrop.getPixels(rotPixels, 0, size, 0, 0, size, size)
++
++        for (i in 0 until total) {
++            val r = refPixels[i]
++            refGray[i] = (((r ushr 16) and 0xFF) + ((r ushr 8) and 0xFF) + (r and 0xFF)) / 3f
++            val t = rotPixels[i]
++            rotGray[i] = (((t ushr 16) and 0xFF) + ((t ushr 8) and 0xFF) + (t and 0xFF)) / 3f
++            rotAlpha[i] = (t ushr 24).toFloat()
++        }
++
++        val center = (size - 1) / 2f
++
++        // Coarse scan: 1-degree steps over the whole circle on a small grid.
++        val scale = size.toFloat() / COARSE_GRID
++        val gridPoints = COARSE_GRID * COARSE_GRID
++        val gridX = FloatArray(gridPoints)
++        val gridY = FloatArray(gridPoints)
++        val refSamples = FloatArray(gridPoints)
++        for (i in 0 until gridPoints) {
++            val gx = (i % COARSE_GRID) * scale
++            val gy = (i / COARSE_GRID) * scale
++            gridX[i] = gx
++            gridY[i] = gy
++            refSamples[i] = refGray[floor(gy).toInt() * size + floor(gx).toInt()]
++        }
++
++        var bestAngle = 0
++        var bestScore = Float.MAX_VALUE
++        for (a in 0 until 360) {
++            val rad = a * PI / 180.0
++            val ca = cos(rad).toFloat()
++            val sa = sin(rad).toFloat()
++            var sum = 0f
++            var valid = 0
++            for (i in 0 until gridPoints) {
++                val vx = gridX[i] - center
++                val vy = gridY[i] - center
++                val qx = center + vx * ca + vy * sa
++                val qy = center - vx * sa + vy * ca
++                if (qx < 0f || qx >= size || qy < 0f || qy >= size) continue
++                val idx = floor(qy).toInt() * size + floor(qx).toInt()
++                if (rotAlpha[idx] <= ALPHA_THRESHOLD) continue
++                val d = refSamples[i] - rotGray[idx]
++                sum += d * d
++                valid++
++            }
++            if (valid < MIN_VALID_PIXELS) continue
++            val score = sum / valid
++            if (score < bestScore) {
++                bestScore = score
++                bestAngle = a
++            }
++        }
++
++        return bestAngle
++    }
++}
