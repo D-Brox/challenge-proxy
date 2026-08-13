@@ -1,0 +1,23 @@
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: comix-flaresolverr
+    restart: unless-stopped
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+      - TZ=UTC
+      - CUSTOM_SESSIONS_AGE_MINUTES=60
+
+  comix-proxy:
+    build: .
+    container_name: comix-proxy
+    restart: unless-stopped
+    depends_on:
+      - flaresolverr
+    ports:
+      - "9191:9191"
+    environment:
+      - PORT=9191
+      - FLARESOLVERR_URL=http://flaresolverr:8191/v1

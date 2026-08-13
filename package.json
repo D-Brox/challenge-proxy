@@ -1,0 +1,17 @@
+{
+  "name": "comix-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Token + WAF cookie minting proxy for the comix.to API",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "pngjs": "^7.0.0"
+  }
+}
