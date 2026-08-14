@@ -12,7 +12,7 @@ index 85c6d8458..5621a43ed 100644
      libVersion = "1.4"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..3da1e63c6 100644
+index ad0975942..d680ff2de 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 @@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
@@ -350,6 +350,24 @@ index ad0975942..3da1e63c6 100644
      }
  
      private fun Document.extractBrowseResponse(): SearchResponse? {
+@@ -355,7 +622,7 @@ abstract class Comix :
+             }
+ 
+             if (query.isNotBlank()) {
+-                addQueryParameter("q", query)
++                addQueryParameter("keyword", query)
+                 build().queryParameterNames
+                     .filter { it.startsWith("order[") }
+                     .forEach(::removeAllQueryParameters)
+@@ -469,7 +736,7 @@ abstract class Comix :
+             .addPathSegment("tags")
+             .addPathSegment("search")
+             .addQueryParameter("type", type)
+-            .addQueryParameter("q", name)
++            .addQueryParameter("keyword", name)
+             .build()
+ 
+         return runCatching {
 @@ -489,7 +756,7 @@ abstract class Comix :
  
      override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
@@ -478,7 +496,15 @@ index ad0975942..3da1e63c6 100644
              val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
              // V3 pages need the query flag so the server returns grid-scramble headers.
              // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -756,6 +1036,191 @@ abstract class Comix :
+@@ -749,6 +1029,7 @@ abstract class Comix :
+                         addQueryParameter("v3", null)
+                     }
+                 }.build().toString()
++
+                 isLegacyScramble -> "$full#scrambled"
+                 else -> full
+             }
+@@ -756,6 +1037,191 @@ abstract class Comix :
          }
      }
  
@@ -670,7 +696,7 @@ index ad0975942..3da1e63c6 100644
      override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
  
      override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -812,6 +1277,7 @@ abstract class Comix :
+@@ -812,6 +1278,7 @@ abstract class Comix :
                  CookieManager.getInstance().apply {
                      setAcceptCookie(true)
                      setAcceptThirdPartyCookies(view, true)
@@ -678,7 +704,7 @@ index ad0975942..3da1e63c6 100644
                  }
  
                  view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1371,11 @@ abstract class Comix :
+@@ -905,7 +1372,11 @@ abstract class Comix :
          if (!completed) {
              throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
          }
@@ -691,7 +717,7 @@ index ad0975942..3da1e63c6 100644
      }
  
      private class WebViewPayloadResult {
-@@ -940,6 +1410,16 @@ abstract class Comix :
+@@ -940,6 +1411,16 @@ abstract class Comix :
  
      // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -708,7 +734,17 @@ index ad0975942..3da1e63c6 100644
          ListPreference(screen.context).apply {
              key = PREF_POSTER_QUALITY
              title = "Thumbnail Quality"
-@@ -1107,14 +1587,22 @@ abstract class Comix :
+@@ -1013,7 +1494,8 @@ abstract class Comix :
+         EditTextPreference(screen.context).apply {
+             key = PREF_SCANLATOR_BLACKLIST
+             title = "Scanlator Blacklist"
+-            summary = "Filter out chapters from specific groups. Comma-separated list of group names or group IDs (e.g., 'Violet Scans, 307')."
++            summary =
++                "Filter out chapters from specific groups. Comma-separated list of group names or group IDs (e.g., 'Violet Scans, 307')."
+             dialogTitle = "Exclude groups"
+             setDefaultValue("")
+         }.let(screen::addPreference)
+@@ -1107,14 +1589,22 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
