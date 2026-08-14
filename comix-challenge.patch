@@ -12,7 +12,7 @@ index 85c6d8458..5621a43ed 100644
      libVersion = "1.4"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..a283be706 100644
+index ad0975942..27c576063 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 @@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
@@ -66,7 +66,7 @@ index ad0975942..a283be706 100644
          .addInterceptor(Descrambler.interceptor)
          .addInterceptor { chain ->
              val request = chain.request()
-@@ -91,9 +103,275 @@ abstract class Comix :
+@@ -91,9 +103,258 @@ abstract class Comix :
          .add("Referer", "$baseUrl/")
          .add("Origin", baseUrl)
          .add("Accept", "*/*")
@@ -165,38 +165,21 @@ index ad0975942..a283be706 100644
 +
 +    /**
 +     * Builds the canonical, sorted, indexed query string exactly like the site's
-+     * serializer: keys sorted, list values expanded to `key[i]=value`, single
-+     * values emitted as `key=value`, values URL-encoded like JS
-+     * `encodeURIComponent`.
++     * serializer: keys sorted, `key[]` arrays expanded to `key[i]=value`, single
++     * values emitted as `key=value`, values emitted raw. The site mints tokens
++     * over the decoded params (colons, spaces, commas, etc. are not
++     * percent-escaped in the canonical), so values are used verbatim here.
 +     */
 +    private fun canonicalizes(params: Map<String, List<String>>): String = buildList {
-+        for (key in params.keys.sorted()) {
-+            val entry = params.getValue(key)
-+            if (entry.size == 1) {
-+                add("$key=${encodeURIComponent(entry[0])}")
++        for ((key, values) in params.entries.sortedBy { it.key }) {
++            val name = key.removeSuffix("[]")
++            if (values.size == 1 && !key.endsWith("[]")) {
++                add("$name=${values[0]}")
 +            } else {
-+                entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
++                values.forEachIndexed { i, v -> add("$name[$i]=$v") }
 +            }
 +        }
 +    }.joinToString("&")
-+
-+    /** JS `encodeURIComponent`: unreserved chars pass through, everything else %-escaped UTF-8. */
-+    private fun encodeURIComponent(value: String): String {
-+        val out = StringBuilder()
-+        for (b in value.toByteArray(Charsets.UTF_8)) {
-+            val c = b.toInt() and 0xFF
-+            if (
-+                (c in 'A'.code..'Z'.code) || (c in 'a'.code..'z'.code) || (c in '0'.code..'9'.code) ||
-+                c == '-'.code || c == '_'.code || c == '.'.code || c == '!'.code ||
-+                c == '~'.code || c == '*'.code || c == '\''.code || c == '('.code || c == ')'.code
-+            ) {
-+                out.append(c.toChar())
-+            } else {
-+                out.append('%').append(HEX[(c ushr 4) and 0xF]).append(HEX[c and 0xF])
-+            }
-+        }
-+        return out.toString()
-+    }
 +
 +    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt`. */
 +    private fun proxyDecrypt(proxy: String, e: String): String? {
@@ -342,7 +325,7 @@ index ad0975942..a283be706 100644
      // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
      // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
      override fun imageRequest(page: Page): Request {
-@@ -137,8 +415,13 @@ abstract class Comix :
+@@ -137,8 +398,13 @@ abstract class Comix :
      )
  
      private fun fetchMangaListFromBrowse(request: Request): Observable<MangasPage> = Observable.fromCallable {
@@ -357,7 +340,7 @@ index ad0975942..a283be706 100644
          }
          val contentRating = request.url.queryParameter("content_rating")
              ?: preferences.contentRating()
-@@ -270,7 +553,7 @@ abstract class Comix :
+@@ -270,7 +536,7 @@ abstract class Comix :
          val mangaList = searchResponse.result.items.map {
              it.toBasicSManga(preferences.posterQuality())
          }
@@ -366,7 +349,7 @@ index ad0975942..a283be706 100644
      }
  
      private fun Document.extractBrowseResponse(): SearchResponse? {
-@@ -489,7 +772,7 @@ abstract class Comix :
+@@ -489,7 +755,7 @@ abstract class Comix :
  
      override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
          val document = runBlocking {
@@ -375,7 +358,7 @@ index ad0975942..a283be706 100644
          }
  
          val initialData = document.selectFirst("script#initial-data")?.data()
-@@ -516,12 +799,14 @@ abstract class Comix :
+@@ -516,12 +782,14 @@ abstract class Comix :
      override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
  
      override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
@@ -393,7 +376,7 @@ index ad0975942..a283be706 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -620,34 +905,8 @@ abstract class Comix :
+@@ -620,34 +888,8 @@ abstract class Comix :
              },
          )
  
@@ -430,7 +413,7 @@ index ad0975942..a283be706 100644
      }
  
      override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
-@@ -685,11 +944,43 @@ abstract class Comix :
+@@ -685,11 +927,43 @@ abstract class Comix :
          }
      }
  
@@ -476,7 +459,7 @@ index ad0975942..a283be706 100644
          }
          val payload = runInWebView(
              document = document,
-@@ -734,10 +1025,15 @@ abstract class Comix :
+@@ -734,10 +1008,15 @@ abstract class Comix :
              },
          )
  
@@ -494,7 +477,7 @@ index ad0975942..a283be706 100644
              val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
              // V3 pages need the query flag so the server returns grid-scramble headers.
              // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -756,6 +1052,184 @@ abstract class Comix :
+@@ -756,6 +1035,193 @@ abstract class Comix :
          }
      }
  
@@ -536,7 +519,15 @@ index ad0975942..a283be706 100644
 +        val params = LinkedHashMap<String, List<String>>()
 +        for (name in url.queryParameterNames) {
 +            val values = url.queryParameterValues(name).filterNotNull()
-+            if (values.isNotEmpty()) params[name] = values
++            if (values.isNotEmpty()) {
++                // The browse URL carries `content_rating` as one comma-joined
++                // value, but the API expects it as a `content_rating[]` array.
++                if (name == "content_rating") {
++                    params["content_rating[]"] = values.flatMap { it.split(",") }
++                } else {
++                    params[name] = values
++                }
++            }
 +        }
 +        if ("limit" !in params) params["limit"] = listOf("28")
 +        return params
@@ -597,10 +588,11 @@ index ad0975942..a283be706 100644
 +        params.entries
 +            .sortedBy { it.key }
 +            .forEach { (key, values) ->
-+                if (values.size == 1) {
-+                    builder.addQueryParameter(key, values[0])
++                val name = key.removeSuffix("[]")
++                if (values.size == 1 && !key.endsWith("[]")) {
++                    builder.addQueryParameter(name, values[0])
 +                } else {
-+                    values.forEachIndexed { i, v -> builder.addQueryParameter("$key[$i]", v) }
++                    values.forEachIndexed { i, v -> builder.addQueryParameter("$name[$i]", v) }
 +                }
 +            }
 +        builder.addQueryParameter("_", token)
@@ -679,7 +671,7 @@ index ad0975942..a283be706 100644
      override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
  
      override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -812,6 +1286,7 @@ abstract class Comix :
+@@ -812,6 +1278,7 @@ abstract class Comix :
                  CookieManager.getInstance().apply {
                      setAcceptCookie(true)
                      setAcceptThirdPartyCookies(view, true)
@@ -687,7 +679,7 @@ index ad0975942..a283be706 100644
                  }
  
                  view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1380,11 @@ abstract class Comix :
+@@ -905,7 +1372,11 @@ abstract class Comix :
          if (!completed) {
              throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
          }
@@ -700,7 +692,7 @@ index ad0975942..a283be706 100644
      }
  
      private class WebViewPayloadResult {
-@@ -940,6 +1419,16 @@ abstract class Comix :
+@@ -940,6 +1411,16 @@ abstract class Comix :
  
      // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -717,7 +709,7 @@ index ad0975942..a283be706 100644
          ListPreference(screen.context).apply {
              key = PREF_POSTER_QUALITY
              title = "Thumbnail Quality"
-@@ -1107,14 +1596,23 @@ abstract class Comix :
+@@ -1107,14 +1588,22 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
@@ -735,7 +727,6 @@ index ad0975942..a283be706 100644
          private const val WEBVIEW_WIDTH = 1080
          private const val WEBVIEW_HEIGHT = 1920
 +        private const val CHALLENGE_PEEK_BYTES = 2048L
-+        private val HEX = "0123456789ABCDEF".toCharArray()
          private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
 +        private val PAGE_ID_REGEX = Regex("""/(\d+)-chapter-""")
          private val CHAPTER_NUM_REGEX = Regex("""Ch\.([\d.]+)""")
