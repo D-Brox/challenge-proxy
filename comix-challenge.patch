@@ -12,7 +12,7 @@ index 85c6d8458..5621a43ed 100644
      libVersion = "1.4"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..be7f7ab7a 100644
+index ad0975942..3da1e63c6 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 @@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
@@ -478,7 +478,7 @@ index ad0975942..be7f7ab7a 100644
              val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
              // V3 pages need the query flag so the server returns grid-scramble headers.
              // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -756,6 +1036,193 @@ abstract class Comix :
+@@ -756,6 +1036,191 @@ abstract class Comix :
          }
      }
  
@@ -567,8 +567,6 @@ index ad0975942..be7f7ab7a 100644
 +    }
 +
 +    private fun Response.isApiChallenge(): Boolean {
-+        if (isSuccessful && code != 302) return false
-+        if (code == 401) return false
 +        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
 +        return body.contains("captcha_required") ||
 +            body.contains("Security check") ||
@@ -672,7 +670,7 @@ index ad0975942..be7f7ab7a 100644
      override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
  
      override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -812,6 +1279,7 @@ abstract class Comix :
+@@ -812,6 +1277,7 @@ abstract class Comix :
                  CookieManager.getInstance().apply {
                      setAcceptCookie(true)
                      setAcceptThirdPartyCookies(view, true)
@@ -680,7 +678,7 @@ index ad0975942..be7f7ab7a 100644
                  }
  
                  view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1373,11 @@ abstract class Comix :
+@@ -905,7 +1371,11 @@ abstract class Comix :
          if (!completed) {
              throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
          }
@@ -693,7 +691,7 @@ index ad0975942..be7f7ab7a 100644
      }
  
      private class WebViewPayloadResult {
-@@ -940,6 +1412,16 @@ abstract class Comix :
+@@ -940,6 +1410,16 @@ abstract class Comix :
  
      // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -710,7 +708,7 @@ index ad0975942..be7f7ab7a 100644
          ListPreference(screen.context).apply {
              key = PREF_POSTER_QUALITY
              title = "Thumbnail Quality"
-@@ -1107,14 +1589,22 @@ abstract class Comix :
+@@ -1107,14 +1587,22 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
