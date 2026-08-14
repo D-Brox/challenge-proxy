@@ -109,4 +109,17 @@ server.listen(PORT, () => {
   } catch (e) {
     console.log(`material: not yet extracted (call POST /load-material to bootstrap)`);
   }
+  (async () => {
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        const c = await ensureCookies();
+        console.log(`cookies: ready (cf_clearance=${c.cf_clearance.length} chars, waf_pass ready)`);
+        return;
+      } catch (e) {
+        console.log(`cookies: pre-solve attempt ${attempt} failed: ${(e && e.message) || e}`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+    console.log('cookies: pre-solve failed after 5 attempts (will solve on demand)');
+  })();
 });
