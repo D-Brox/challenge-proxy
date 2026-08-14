@@ -35,10 +35,10 @@ The server listens on `http://localhost:9191` by default.
 
 - `GET /sign?path=${api_path}&qs=${canonical_query}&force=1` — mints a signed `_` token for the API call and returns the current `cf_clearance`, `waf_pass` and `user_agent` to use with it.
 - `GET /cookies?force=1` — returns the current `cf_clearance`, `waf_pass` and `user_agent` (used when a page is served a fresh captcha).
-- `GET /material` — returns the current JS cipher material as `{"s":[...],"k":[...]}`.
+- `GET /material` — returns the current JS cipher material as `{"s":[...],"k":[...]}` (for debugging).
 - `POST /refresh-material` — re-extracts the cipher material from the live site with Playwright (triggered by the extension when a material rotation is detected).
 - `POST /load-material` — ensures cipher material is available, extracting it from the live site with Playwright if none is on disk; returns a status (whether it was already loaded, extracted, or failed).
-- `GET /decrypt?e=${envelope}` — decodes a signed API envelope.
+- `POST /decrypt` — decodes a signed API envelope; `e` is sent in the JSON body (`{"e":"..."}`).
 - `GET /health` — simple liveness check.
 
 ## How it works

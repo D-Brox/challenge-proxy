@@ -5,7 +5,8 @@
 //   GET /sign?path=/api/v1/manga/...&qs=<canonical>
 //   -> { token, waf_pass, cf_clearance, user_agent }
 //
-//   GET /refresh-material   -> re-extracts cipher material from the live site
+//   POST /decrypt  body { e } -> { json }
+//   POST /refresh-material   -> re-extracts cipher material from the live site
 //   GET /health             -> { material: {...}, cookies: {...} }
 import http from 'node:http';
 import { URL } from 'node:url';
@@ -39,8 +40,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { token, ...cookies });
     }
 
-    if (u.pathname === '/decrypt' && req.method === 'GET') {
-      const e = u.searchParams.get('e');
+    if (u.pathname === '/decrypt' && req.method === 'POST') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      let e;
+      try {
+        e = JSON.parse(body || '{}').e;
+      } catch (err) {
+        return send(res, 400, { error: 'invalid JSON body' });
+      }
       if (!e) return send(res, 400, { error: 'missing e' });
       return send(res, 200, { json: decryptE(e).toString('utf8') });
     }
@@ -92,6 +100,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/' || u.pathname === '') {
       return send(res, 200, {
         endpoints: ['/sign', '/decrypt', '/cookies', '/material', '/refresh-material', '/load-material', '/health'],
+        decrypt: 'POST /decrypt with body {"e":"..."} (GET removed: oversized header caused 431)',
       });
     }
 
