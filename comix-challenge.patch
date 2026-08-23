@@ -1,72 +1,79 @@
 diff --git a/src/en/comix/build.gradle.kts b/src/en/comix/build.gradle.kts
-index 85c6d8458..8d457936e 100644
+index 31b055538..c72a49ab2 100644
 --- a/src/en/comix/build.gradle.kts
 +++ b/src/en/comix/build.gradle.kts
 @@ -6,7 +6,7 @@ plugins {
  
  keiyoushi {
      name = "Comix"
--    versionCode = 34
+-    versionCode = 35
 +    versionCode = 36
      contentWarning = ContentWarning.MIXED
-     libVersion = "1.4"
+     libVersion = "1.6"
  
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-index ad0975942..68f2d685b 100644
+index 1d4583543..b036e267a 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
-@@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.en.comix
+@@ -1,6 +1,9 @@
+ package eu.kanade.tachiyomi.extension.en.comix
  
- import android.annotation.SuppressLint
  import android.content.SharedPreferences
 +import android.graphics.BitmapFactory
- import android.os.Handler
- import android.os.Looper
 +import android.util.Base64
- import android.view.View
- import android.view.ViewGroup
- import android.webkit.CookieManager
-@@ -18,6 +20,7 @@ import androidx.preference.MultiSelectListPreference
++import android.webkit.CookieManager
+ import android.webkit.WebResourceResponse
+ import androidx.preference.EditTextPreference
+ import androidx.preference.ListPreference
+@@ -8,6 +11,7 @@ import androidx.preference.MultiSelectListPreference
  import androidx.preference.PreferenceScreen
  import androidx.preference.SwitchPreferenceCompat
  import eu.kanade.tachiyomi.network.GET
 +import eu.kanade.tachiyomi.network.POST
- import eu.kanade.tachiyomi.network.awaitSuccess
  import eu.kanade.tachiyomi.source.ConfigurableSource
  import eu.kanade.tachiyomi.source.model.FilterList
-@@ -33,8 +36,12 @@ import keiyoushi.utils.applicationContext
- import keiyoushi.utils.firstInstanceOrNull
- import keiyoushi.utils.getPreferencesLazy
+ import eu.kanade.tachiyomi.source.model.MangasPage
+@@ -27,21 +31,26 @@ import keiyoushi.utils.int
  import keiyoushi.utils.parseAs
+ import keiyoushi.utils.runWebView
+ import keiyoushi.utils.string
 +import keiyoushi.utils.toJsonRequestBody
- import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.serialization.json.JsonElement
  import kotlinx.serialization.json.JsonObject
 +import kotlinx.serialization.json.JsonPrimitive
+ import kotlinx.serialization.json.buildJsonObject
+ import kotlinx.serialization.json.put
 +import okhttp3.CookieJar
-+import okhttp3.Headers
+ import okhttp3.Headers
  import okhttp3.HttpUrl
  import okhttp3.HttpUrl.Companion.toHttpUrl
  import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-@@ -44,6 +51,7 @@ import okio.Buffer
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
++import okhttp3.Response
+ import okio.Buffer
  import org.json.JSONObject
  import org.jsoup.nodes.Document
- import rx.Observable
 +import java.net.URLEncoder
- import java.util.concurrent.Semaphore
- import java.util.concurrent.TimeUnit
- import java.util.concurrent.atomic.AtomicBoolean
-@@ -62,6 +70,7 @@ abstract class Comix :
-     private val preferences: SharedPreferences by getPreferencesLazy()
+ import java.util.concurrent.atomic.AtomicLong
+ import kotlin.time.Duration
+ import kotlin.time.Duration.Companion.milliseconds
+@@ -66,7 +75,8 @@ abstract class Comix :
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>?) = size > TAG_ID_CACHE_SIZE
+     }
  
-     override val client = network.client.newBuilder()
-+        .cookieJar(CookieJar.NO_COOKIES)
-         .addInterceptor(Descrambler.interceptor)
+-    override fun OkHttpClient.Builder.configureClient() = addInterceptor(Descrambler.interceptor)
++    override fun OkHttpClient.Builder.configureClient() = cookieJar(CookieJar.NO_COOKIES)
++        .addInterceptor(Descrambler.interceptor)
          .addInterceptor { chain ->
              val request = chain.request()
-@@ -91,9 +100,241 @@ abstract class Comix :
-         .add("Referer", "$baseUrl/")
-         .add("Origin", baseUrl)
-         .add("Accept", "*/*")
+ 
+@@ -91,6 +101,225 @@ abstract class Comix :
+         .rateLimit(5)
+ 
+     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
 +        .apply {
 +            val proxy = proxyServer()
 +            if (proxy != null) {
@@ -77,11 +84,6 @@ index ad0975942..68f2d685b 100644
 +            }
 +        }
 +
-+    private val liveHeaders: Headers
-+        get() = headersBuilder().build()
- 
-     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
- 
 +    // ============================== WAF ==============================
 +    // The site serves a rotate-to-align captcha before trusting a client. The
 +    // "main" image is a circle at the correct orientation and the "thumb" is its
@@ -154,18 +156,6 @@ index ad0975942..68f2d685b 100644
 +     * percent-escaped in the canonical), so values are used verbatim here.
 +     */
 +    private fun canonicalizes(params: Map<String, List<String>>): String = canonicalEntries(params).joinToString("&") { (name, value) -> "$name=$value" }
-+
-+    /** Sorted, bracket-expanded `(name, value)` pairs shared by the query-string and URL builders. */
-+    private fun canonicalEntries(params: Map<String, List<String>>): Sequence<Pair<String, String>> = sequence {
-+        for ((key, values) in params.entries.sortedBy { it.key }) {
-+            val name = key.removeSuffix("[]")
-+            if (values.size == 1 && !key.endsWith("[]")) {
-+                yield(name to values[0])
-+            } else {
-+                values.forEachIndexed { i, v -> yield("$name[$i]" to v) }
-+            }
-+        }
-+    }
 +
 +    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt` (POST). */
 +    private fun proxyDecrypt(proxy: String, e: String): String? {
@@ -267,11 +257,13 @@ index ad0975942..68f2d685b 100644
 +     * mode the refresh goes through the proxy (`/cookies?force=1`) which solves
 +     * Cloudflare + the site captcha remotely.
 +     */
++    private suspend fun fetchPage(url: HttpUrl): Document = fetchPage(url.toString())
++
 +    private suspend fun fetchPage(url: String): Document {
-+        val document = client.newCall(GET(url, liveHeaders)).awaitSuccess().asJsoup()
++        val document = client.get(url).asJsoup()
 +        if (!document.isWafChallenge()) return document
 +        refreshCookiesOrWaf()
-+        val retry = client.newCall(GET(url, liveHeaders)).awaitSuccess().asJsoup()
++        val retry = client.get(url).asJsoup()
 +        if (retry.isWafChallenge()) {
 +            throw Exception("WAF challenge could not be solved")
 +        }
@@ -301,229 +293,49 @@ index ad0975942..68f2d685b 100644
 +
 +    private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
 +        selectFirst("#stage") != null
-+
-     // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
-     // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
-     override fun imageRequest(page: Page): Request {
-@@ -113,7 +354,7 @@ abstract class Comix :
-                 .removeAll("Origin")
-                 .build()
-         } else {
--            headers
-+            liveHeaders
+ 
+     override suspend fun getPopularManga(page: Int): MangasPage {
+         val url = baseUrl.toHttpUrl().newBuilder().apply {
+@@ -110,7 +339,7 @@ abstract class Comix :
+             )
          }
-         return GET(urlWithoutFragment, requestHeaders)
-     }
-@@ -127,7 +368,7 @@ abstract class Comix :
-             applyBrowseContentPreferences()
-         }.build()
  
--        return GET(url, headers)
-+        return GET(url, liveHeaders)
-     }
- 
-     override fun popularMangaParse(response: Response) = throw UnsupportedOperationException()
-@@ -137,8 +378,13 @@ abstract class Comix :
-     )
- 
-     private fun fetchMangaListFromBrowse(request: Request): Observable<MangasPage> = Observable.fromCallable {
-+        nativeMangaList(request)
-+            ?: webViewMangaListFromBrowse(request)
-+    }
-+
-+    private fun webViewMangaListFromBrowse(request: Request): MangasPage {
-         val document = runBlocking {
--            client.newCall(request).awaitSuccess().asJsoup()
-+            fetchPage(request.url.toString())
-         }
-         val contentRating = request.url.queryParameter("content_rating")
+-        val document = client.get(url).asJsoup()
++        val document = fetchPage(url)
+         val contentRating = url.queryParameter("content_rating")
              ?: preferences.contentRating()
-@@ -270,7 +516,7 @@ abstract class Comix :
-         val mangaList = searchResponse.result.items.map {
-             it.toBasicSManga(preferences.posterQuality())
-         }
--        MangasPage(mangaList, searchResponse.result.hasNextPage())
-+        return MangasPage(mangaList, searchResponse.result.hasNextPage())
-     }
+         val effectiveContentRating = contentRating
+@@ -363,10 +592,8 @@ abstract class Comix :
+         synchronized(tagIdCache) { tagIdCache[cacheKey] }?.let { return it }
  
-     private fun Document.extractBrowseResponse(): SearchResponse? {
-@@ -295,7 +541,7 @@ abstract class Comix :
-             applyBrowseContentPreferences()
-         }.build()
- 
--        return GET(url, headers)
-+        return GET(url, liveHeaders)
-     }
- 
-     override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
-@@ -355,7 +601,7 @@ abstract class Comix :
-             }
- 
-             if (query.isNotBlank()) {
--                addQueryParameter("q", query)
-+                addQueryParameter("keyword", query)
-                 build().queryParameterNames
-                     .filter { it.startsWith("order[") }
-                     .forEach(::removeAllQueryParameters)
-@@ -365,7 +611,7 @@ abstract class Comix :
-             addQueryParameter("page", page.toString())
-         }.build()
- 
--        return GET(url, headers)
-+        return GET(url, liveHeaders)
-     }
- 
-     override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
-@@ -469,11 +715,11 @@ abstract class Comix :
-             .addPathSegment("tags")
-             .addPathSegment("search")
+         val url = apiUrl.toHttpUrl().newBuilder()
+-            .addPathSegment("tags")
+-            .addPathSegment("search")
              .addQueryParameter("type", type)
 -            .addQueryParameter("q", name)
 +            .addQueryParameter("keyword", name)
              .build()
  
-         return runCatching {
--            client.newCall(GET(url, headers)).execute().use { response ->
-+            client.newCall(GET(url, liveHeaders)).execute().use { response ->
-                 response.parseAs<TagSearchResponse>().result.map { it.id.toString() }
-             }
-         }.getOrDefault(emptyList())
-@@ -483,13 +729,13 @@ abstract class Comix :
-     override fun getFilterList() = Filters().getFilterList()
- 
-     // ============================== Details ==============================
--    override fun mangaDetailsRequest(manga: SManga): Request = GET(getMangaUrl(manga), headers)
-+    override fun mangaDetailsRequest(manga: SManga): Request = GET(getMangaUrl(manga), liveHeaders)
- 
-     override fun mangaDetailsParse(response: Response) = throw UnsupportedOperationException()
- 
-     override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
-         val document = runBlocking {
--            client.newCall(GET(getMangaUrl(manga), headers)).awaitSuccess().asJsoup()
-+            fetchPage(getMangaUrl(manga))
+         val ids = runCatching {
+@@ -385,7 +612,7 @@ abstract class Comix :
+         var cachedDocument: Document? = null
+         suspend fun getDocument(): Document {
+             cachedDocument?.let { return it }
+-            return client.get(getMangaUrl(manga)).asJsoup().also { cachedDocument = it }
++            return fetchPage(getMangaUrl(manga)).also { cachedDocument = it }
          }
  
-         val initialData = document.selectFirst("script#initial-data")?.data()
-@@ -516,12 +762,14 @@ abstract class Comix :
-     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
- 
-     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
--        val deduplicate = preferences.deduplicateChapters()
--        val blacklist = preferences.scanlatorBlacklist()
-+        nativeChapterList(manga) ?: webViewChapterList(manga)
-+    }
-+
-+    private fun webViewChapterList(manga: SManga): List<SChapter> {
-         val mangaSlug = manga.url.removePrefix("/")
- 
-         val document = runBlocking {
--            client.newCall(GET(getMangaUrl(manga), headers)).awaitSuccess().asJsoup()
-+            fetchPage(getMangaUrl(manga))
-         }
-         val payload = runInWebView(
-             document = document,
-@@ -620,34 +868,8 @@ abstract class Comix :
-             },
-         )
- 
--        val allChapters = payload.parseAs<List<Chapter>>()
--
--        // Filter out groups specified in the blacklist first
--        val filteredChapters = if (blacklist.isNotEmpty()) {
--            allChapters.filter { ch ->
--                val scanlatorName = when {
--                    ch.group != null -> ch.group.name
--                    ch.isOfficial -> "Official"
--                    else -> "Unknown"
--                }
--                val nameNormalized = scanlatorName.trim().lowercase()
--                val idStr = ch.group?.id?.toString()
--
--                nameNormalized !in blacklist && idStr !in blacklist
--            }
--        } else {
--            allChapters
--        }
--
--        val finalChapters: List<Chapter> = if (deduplicate) {
--            val chapterMap = LinkedHashMap<Number, Chapter>()
--            deduplicateChapters(chapterMap, filteredChapters)
--            chapterMap.values.toList()
--        } else {
--            filteredChapters
--        }
--
--        finalChapters.map { it.toSChapter(mangaSlug) }
-+        val chapters = buildChapters(payload.parseAs<List<Chapter>>(), mangaSlug)
-+        return chapters
+         val deduplicateChapters = preferences.deduplicateChapters()
+@@ -615,7 +842,7 @@ abstract class Comix :
      }
  
-     override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
-@@ -685,11 +907,43 @@ abstract class Comix :
-         }
-     }
- 
-+    private fun buildChapters(allChapters: List<Chapter>, mangaSlug: String): List<SChapter> {
-+        val blacklist = preferences.scanlatorBlacklist()
-+        val filteredChapters = if (blacklist.isNotEmpty()) {
-+            allChapters.filter { ch ->
-+                val scanlatorName = when {
-+                    ch.group != null -> ch.group.name
-+                    ch.isOfficial -> "Official"
-+                    else -> "Unknown"
-+                }
-+                val nameNormalized = scanlatorName.trim().lowercase()
-+                val idStr = ch.group?.id?.toString()
-+
-+                nameNormalized !in blacklist && idStr !in blacklist
-+            }
-+        } else {
-+            allChapters
-+        }
-+
-+        val finalChapters: List<Chapter> = if (preferences.deduplicateChapters()) {
-+            val chapterMap = LinkedHashMap<Number, Chapter>()
-+            deduplicateChapters(chapterMap, filteredChapters)
-+            chapterMap.values.toList()
-+        } else {
-+            filteredChapters
-+        }
-+
-+        return finalChapters.map { it.toSChapter(mangaSlug) }
-+    }
-+
-     // =============================== Pages ===============================
-     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
--        val request = GET(getChapterUrl(chapter), headers)
-+        nativePageList(chapter) ?: webViewPageList(chapter)
-+    }
-+
-+    private fun webViewPageList(chapter: SChapter): List<Page> {
-         val document = runBlocking {
--            client.newCall(request).awaitSuccess().asJsoup()
-+            fetchPage(getChapterUrl(chapter))
-         }
-         val payload = runInWebView(
-             document = document,
-@@ -734,10 +988,15 @@ abstract class Comix :
-             },
-         )
- 
--        val pages = payload.parseAs<ChapterResponse>().result.pages
-+        val pages = buildPages(payload.parseAs<ChapterResponse>())
-+        return pages
-+    }
-+
-+    private fun buildPages(payload: ChapterResponse): List<Page> {
-+        val pages = payload.result.pages
-         val base = pages.baseUrl.trimEnd('/')
- 
--        pages.items.mapIndexed { index, img ->
-+        return pages.items.mapIndexed { index, img ->
-             val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
-             // V3 pages need the query flag so the server returns grid-scramble headers.
-             // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-@@ -749,6 +1008,7 @@ abstract class Comix :
+     private suspend fun getNativeChapterList(manga: SManga, latestChapterId: Int?): List<SChapter>? {
+-        if (cipher == null) return null
++        if (proxyServer() == null && cipher == null) return null
+         val mangaSlug = getMangaUrl(manga).toHttpUrl().pathSegments.getOrNull(1) ?: return null
+         val mangaId = manga.mangaId() ?: return null
+         val chapters = mutableListOf<Chapter>()
+@@ -727,6 +954,7 @@ abstract class Comix :
                          addQueryParameter("v3", null)
                      }
                  }.build().toString()
@@ -531,8 +343,14 @@ index ad0975942..68f2d685b 100644
                  isLegacyScramble -> "$full#scrambled"
                  else -> full
              }
-@@ -756,6 +1016,169 @@ abstract class Comix :
-         }
+@@ -735,17 +963,128 @@ abstract class Comix :
+     }
+ 
+     private suspend fun getNativePageList(chapter: SChapter): List<Page>? {
+-        if (cipher == null) return null
++        if (proxyServer() == null && cipher == null) return null
+         val chapterId = chapter.chapterId() ?: return null
+         return getSigned<ChapterResponse>("/api/v1/chapters/$chapterId", emptyMap())?.let(::buildPages)
      }
  
 +    // ====================== Native signed API =========================
@@ -568,33 +386,13 @@ index ad0975942..68f2d685b 100644
 +        }
 +    }
 +
-+    /** The /api/v1/manga request mirrors the browse URL params. */
-+    private fun nativeMangaParams(url: HttpUrl): Map<String, List<String>> {
-+        val params = linkedMapOf<String, List<String>>()
-+        for (name in url.queryParameterNames) {
-+            val values = url.queryParameterValues(name).filterNotNull()
-+            if (values.isNotEmpty()) {
-+                // The browse URL carries `content_rating` as one comma-joined
-+                // value, but the API expects it as a `content_rating[]` array.
-+                if (name == "content_rating") {
-+                    params["content_rating[]"] = values.flatMap { it.split(",") }
-+                } else {
-+                    params[name] = values
-+                }
-+            }
-+        }
-+        if ("limit" !in params) params["limit"] = listOf("28")
-+        return params
-+    }
-+
 +    /**
-+     * Executes a signed native API call: ensures the proxy has material, mints
++     * Executes a proxy-backed signed call: ensures material is loaded, mints
 +     * the token via `/sign`, builds the URL with the same canonical param
 +     * ordering, and retries once with a forced cookie refresh when the server
-+     * answers with a `captcha_required` challenge.
++     * answers with a challenge.
 +     */
-+    private fun executeSigned(path: String, params: Map<String, List<String>>): Response {
-+        val proxy = proxyServer() ?: throw Exception("Proxy server not configured")
++    private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
 +        if (!ensureProxyMaterial(proxy)) {
 +            throw Exception("Proxy material not available")
 +        }
@@ -630,7 +428,7 @@ index ad0975942..68f2d685b 100644
 +            .addPathSegments(path.trimStart('/'))
 +        canonicalEntries(params).forEach { (name, value) -> builder.addQueryParameter(name, value) }
 +        builder.addQueryParameter("_", token)
-+        return GET(builder.build(), liveHeaders)
++        return GET(builder.build(), headers)
 +    }
 +
 +    private fun responseBodyOrThrow(response: Response): String {
@@ -659,79 +457,35 @@ index ad0975942..68f2d685b 100644
 +            ?: throw CipherRotatedException("decrypt failed")
 +    }
 +
-+    private fun nativeMangaList(request: Request): MangasPage? = withProxy {
-+        val response = executeSigned("/api/v1/manga", nativeMangaParams(request.url))
-+        val items = responseBodyOrThrow(response).parseAs<SearchResponse>().result
-+        MangasPage(
-+            items.items.map { it.toBasicSManga(preferences.posterQuality()) },
-+            items.hasNextPage(),
-+        )
-+    }
-+
-+    private fun nativeChapterList(manga: SManga): List<SChapter>? {
-+        val mangaSlug = manga.url.removePrefix("/")
-+        val hid = mangaSlug.substringBefore("-").takeIf { it.isNotBlank() } ?: return null
-+        return withProxy {
-+            val allChapters = mutableListOf<Chapter>()
-+            var page = 1
-+            while (page <= NATIVE_MAX_CHAPTER_PAGES) {
-+                val params = linkedMapOf(
-+                    "page" to listOf(page.toString()),
-+                    "limit" to listOf("100"),
-+                    "order[number]" to listOf("desc"),
-+                )
-+                val response = executeSigned("/api/v1/manga/$hid/chapters", params)
-+                val result = responseBodyOrThrow(response).parseAs<ChapterDetailsResponse>().result
-+                allChapters += result.items
-+                if (!result.hasNextPage() || result.items.isEmpty()) break
-+                page++
-+            }
-+            buildChapters(allChapters, mangaSlug)
+     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
+ 
+     private suspend inline fun <reified T> getSigned(
+         path: String,
+         params: Map<String, List<String>>,
+     ): T? {
++        val proxy = proxyServer()
++        if (proxy != null) {
++            val body = withProxy {
++                responseBodyOrThrow(executeSignedViaProxy(proxy, path, params))
++            } ?: return null
++            return body.parseAs<T>()
 +        }
-+    }
-+
-+    private fun nativePageList(chapter: SChapter): List<Page>? {
-+        val cid = PAGE_ID_REGEX.find(chapter.url)?.groupValues?.get(1) ?: return null
-+        return withProxy {
-+            val response = executeSigned("/api/v1/chapters/$cid", emptyMap())
-+            buildPages(responseBodyOrThrow(response).parseAs<ChapterResponse>())
+         val currentCipher = cipher ?: return null
+         return runCatching {
+             val entries = canonicalEntries(params)
+@@ -806,6 +1145,9 @@ abstract class Comix :
+         initializationScript: String? = null,
+         buildScript: (passPayloadName: String, rejectName: String) -> String,
+     ): String {
++        runCatching {
++            storedWafCookie()?.let { CookieManager.getInstance().setCookie(baseUrl, it) }
 +        }
-+    }
-+
-     override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
+         val timeoutDeadline = AtomicLong(
+             System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds,
+         )
+@@ -901,6 +1243,16 @@ abstract class Comix :
+         pathSegments[4] == "chapters"
  
-     override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-@@ -806,12 +1229,13 @@ abstract class Comix :
-                     loadWithOverviewMode = true
-                     useWideViewPort = true
-                     blockNetworkImage = false
--                    userAgentString = headers["User-Agent"]
-+                    userAgentString = liveHeaders["User-Agent"]
-                 }
- 
-                 CookieManager.getInstance().apply {
-                     setAcceptCookie(true)
-                     setAcceptThirdPartyCookies(view, true)
-+                    storedWafCookie()?.let { setCookie(baseUrl, it) }
-                 }
- 
-                 view.addJavascriptInterface(payloadResult, interfaceName)
-@@ -905,7 +1329,11 @@ abstract class Comix :
-         if (!completed) {
-             throw Exception("Timed out waiting for WebView payload (url=$lastUrl)")
-         }
--        return payloadResult.payload ?: throw Exception("Failed to capture WebView payload")
-+        val payload = payloadResult.payload
-+        if (payload == null) {
-+            throw Exception("Failed to capture WebView payload")
-+        }
-+        return payload
-     }
- 
-     private class WebViewPayloadResult {
-@@ -940,6 +1368,16 @@ abstract class Comix :
- 
-     // ============================= Settings =============================
      override fun setupPreferenceScreen(screen: PreferenceScreen) {
 +        EditTextPreference(screen.context).apply {
 +            key = PREF_PROXY_SERVER
@@ -743,10 +497,10 @@ index ad0975942..68f2d685b 100644
 +            setDefaultValue("")
 +        }.let(screen::addPreference)
 +
-         ListPreference(screen.context).apply {
-             key = PREF_POSTER_QUALITY
-             title = "Thumbnail Quality"
-@@ -1013,7 +1451,8 @@ abstract class Comix :
+         SwitchPreferenceCompat(screen.context).apply {
+             key = PREF_FETCH_CHAPTERS_UNTIL_KNOWN
+             title = "Faster chapter list fetching"
+@@ -972,7 +1324,8 @@ abstract class Comix :
          EditTextPreference(screen.context).apply {
              key = PREF_SCANLATOR_BLACKLIST
              title = "Scanlator Blacklist"
@@ -756,7 +510,7 @@ index ad0975942..68f2d685b 100644
              dialogTitle = "Exclude groups"
              setDefaultValue("")
          }.let(screen::addPreference)
-@@ -1107,14 +1546,22 @@ abstract class Comix :
+@@ -1069,14 +1422,20 @@ abstract class Comix :
          private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
          private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
          private const val PREF_SCORE_POSITION = "pref_score_position"
@@ -767,25 +521,23 @@ index ad0975942..68f2d685b 100644
  
          private const val DEFAULT_CONTENT_RATING = "suggestive"
 +        private const val WAF_MAX_ATTEMPTS = 3
-+        private const val NATIVE_MAX_CHAPTER_PAGES = 200
-         private const val WEBVIEW_START_TIMEOUT_SECONDS = 120L
-         private const val WEBVIEW_TIMEOUT_SECONDS = 90L
+         private const val WEBVIEW_TIMEOUT_SECONDS = 120L
          private const val SCRIPT_RETRY_INTERVAL_MS = 100L
-         private const val WEBVIEW_WIDTH = 1080
-         private const val WEBVIEW_HEIGHT = 1920
+         private const val MAX_CHAPTER_PAGES = 200
+         private const val HEX = "0123456789ABCDEF"
+         private const val URI_COMPONENT_SAFE_CHARS = "-_.!~*'()"
+         private const val TAG_ID_CACHE_SIZE = 50
 +        private const val CHALLENGE_PEEK_BYTES = 2048L
          private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
-+        private val PAGE_ID_REGEX = Regex("""/(\d+)-chapter-""")
-         private val CHAPTER_NUM_REGEX = Regex("""Ch\.([\d.]+)""")
-         private val GROUP_ID_REGEX = Regex("""/groups/(\d+)""")
-         private val CHAPTER_ID_REGEX = Regex("""/(\d+)-""")
+     }
+ }
 diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
-index 8f69de428..53e662f73 100644
+index a8af96414..b1b063a31 100644
 --- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
 +++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
-@@ -8,6 +8,24 @@ import java.math.BigDecimal
- import java.math.RoundingMode
- import java.util.Calendar
+@@ -14,6 +14,24 @@ const val MANGA_ID_MEMO = "mangaId"
+ const val CHAPTER_ID_MEMO = "chapterId"
+ const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
  
 +@Serializable
 +class WafChallengeResponse(
@@ -808,7 +560,7 @@ index 8f69de428..53e662f73 100644
  @Serializable
  class Term(
      val title: String,
-@@ -329,3 +347,32 @@ class ChapterResponse(
+@@ -333,3 +351,32 @@ class ChapterResponse(
          val s: Int = 0,
      )
  }
