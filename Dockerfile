@@ -8,6 +8,7 @@ RUN apk add --no-cache \
       ca-certificates \
       ttf-freefont \
       font-noto-cjk \
+      xvfb \
       dumb-init
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
