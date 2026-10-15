@@ -18,10 +18,12 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { signedUrl, apiRequest, rebuild, parseParams, oracleStats } from './lib/oracle.js';
 import { ensureCookies, getCfClearance } from './lib/waf.js';
+import { log, bodySummary } from './lib/log.js';
 
 const PORT = Number(process.env.PORT || 9191);
 const REFRESH_TOKEN = process.env.REFRESH_TOKEN || '';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const LOG_STACK = /^(1|true)$/i.test(process.env.LOG_STACK || '');
 
 function send(res, code, obj) {
   res.writeHead(code, {
@@ -59,12 +61,24 @@ function readJsonBody(req) {
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const started = Date.now();
+  // handlers add what they learn about the call; it rides out on the access line
+  const detail = {};
+  res.on('finish', () => {
+    log.info(`${req.method} ${u.pathname}`, {
+      status: res.statusCode,
+      ms: Date.now() - started,
+      ...detail,
+    });
+  });
+
   try {
     if (u.pathname === '/sign' && req.method === 'GET') {
       const path = u.searchParams.get('path');
       if (!path) return send(res, 400, { error: 'missing path' });
       const qs = u.searchParams.get('qs') || '';
       const force = u.searchParams.get('force') === '1';
+      Object.assign(detail, { path, force: force || undefined });
       // The site builds and signs the request itself; the token comes off the wire.
       const url = await signedUrl(path, parseParams(qs));
       const token = url.match(/[?&]_=([^&]+)/);
@@ -79,7 +93,10 @@ const server = http.createServer(async (req, res) => {
       const { path, qs, params } = await readJsonBody(req);
       if (!path) return send(res, 400, { error: 'missing path' });
       const resolved = params || parseParams(qs || '');
-      return send(res, 200, { json: await apiRequest(path, resolved) });
+      Object.assign(detail, { path, qs: qs || undefined });
+      const json = await apiRequest(path, resolved);
+      Object.assign(detail, bodySummary(json));
+      return send(res, 200, { json });
     }
 
     if (u.pathname === '/decrypt' && req.method === 'POST') {
@@ -131,12 +148,18 @@ const server = http.createServer(async (req, res) => {
 
     send(res, 404, { error: 'not found' });
   } catch (e) {
+    // the stack is what tells a spent cookie jar apart from a real endpoint change
+    log.error(`unhandled failure on ${req.method} ${u.pathname}`, {
+      error: String((e && e.message) || e),
+      ...detail,
+      stack: LOG_STACK ? String((e && e.stack) || '').split('\n').slice(0, 4) : undefined,
+    });
     send(res, 500, { error: String((e && e.message) || e) });
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`comix-proxy listening on :${PORT}`);
+  log.info('comix-proxy listening', { port: PORT, flaresolverr: process.env.FLARESOLVERR_URL || 'default', logLevel: process.env.LOG_LEVEL || 'info' });
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
