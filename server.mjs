@@ -17,7 +17,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { signedUrl, apiRequest, rebuild, parseParams, oracleStats } from './lib/oracle.js';
-import { ensureCookies, getCfClearance } from './lib/waf.js';
+import { ensureCookies, getCfClearance, jarBufferStats } from './lib/waf.js';
 import { log, bodySummary } from './lib/log.js';
 
 const PORT = Number(process.env.PORT || 9191);
@@ -137,7 +137,7 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         cookies.error = String(e.message || e);
       }
-      return send(res, 200, { status: 'ok', oracle: oracleStats(), cookies });
+      return send(res, 200, { status: 'ok', oracle: oracleStats(), cookies, jars: jarBufferStats() });
     }
 
     if (u.pathname === '/' || u.pathname === '') {
