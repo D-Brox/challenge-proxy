@@ -1,7 +1,7 @@
 # Comix Proxy server
 
-A server that signs and decodes comix.to API requests and keeps the WAF cookies
-those requests need, so the extension never has to boot a WebView to do crypto.
+A server that signs comix.to API requests and fetches protected bodies, so the
+extension never has to boot a WebView to do crypto.
 
 The site re-obfuscates its bundle on every deploy. It used to ship a plain
 S-box cipher whose material could be lifted out of the bundle and reimplemented,
@@ -12,10 +12,27 @@ decoded body. That also means a redeploy needs no change here: the browser loads
 whatever is live and finds the primitives by behaviour, never by name.
 
 The bundle also sits behind Cloudflare, and Cloudflare clearance comes from
-FlareSolverr. The site's own `@waf/generate` endpoint is gone — the current site serves a
-Cloudflare Turnstile widget instead — so there is no captcha to solve here. `waf_pass` is
-still requested and stored when the site hands one out, but it is best-effort and never
-blocks signing; `cf_clearance` is the cookie that actually matters.
+FlareSolverr. The site's own `@waf/generate` endpoint is gone — it answers `500
+captcha generation failed` and never issues a challenge, so there is no captcha to solve
+here and none of the image processing that went with it. `cf_clearance` is the cookie that
+matters.
+
+### One jar per request
+
+A cookie jar is worth about **one** API call. After that the site answers `502` to
+everything on it, whatever the URL, and the budget never comes back — the same jar was
+still dead a minute later. The 502 is Cloudflare reporting that comix.to's own origin
+failed (`origin_bad_gateway`, `retry-after: 60`), not a rate limit and not the site's
+"no user input" flag, which is not set on those requests.
+
+So every request is served from a freshly solved jar and the page holding it is thrown
+away afterwards. FlareSolverr needs ~11s per jar, so jars are solved continuously into a
+buffer and a request takes one that is ready. That is the ceiling on request rate: adding
+FlareSolverr replicas is the only way to raise it. Responses are cached for five minutes,
+because repeat browsing is otherwise a fresh jar per repeat.
+
+Loading an HTML page is free — only the API call is charged — and responses Cloudflare
+can serve from its edge (`x-cache: HIT`) never reach the origin.
 
 ## The recovered cipher
 
@@ -72,14 +89,18 @@ The server listens on `http://localhost:9191` by default.
 
 ## Endpoints
 
-- `GET /sign?path=${api_path}&qs=${canonical_query}[&force=1]` — returns
-  `{"token", "waf_pass", "cf_clearance", "user_agent"}`. `qs` arrives already
-  canonicalized by the client and is used verbatim. `force=1` re-solves the
-  cookies instead of reusing them.
-- `POST /decrypt` with `{"e": "<envelope>"}` — returns `{"json": "<decoded body>"}`.
-- `GET /cookies?force=1` — returns the current `cf_clearance`, `waf_pass` and
-  `user_agent`, for when a request is served a fresh captcha.
-- `GET /health` — liveness plus oracle counters (`signs`, `decrypts`, `rebuilds`).
+- `POST /request` with `{"path", "qs"}` — the one that matters. Returns `{"json": "<body>"}`,
+  plain JSON, exactly as the site's own client reads it. `path` and `qs` are reissued
+  through the bundle rather than replayed, because a captured `{"e": ...}` envelope cannot
+  be decoded on its own: the bundle exposes no decoder, only the client that unwraps what
+  it just received. Results are cached for `ORACLE_CACHE_TTL_MS`.
+- `GET /sign?path=${api_path}&qs=${canonical_query}` — returns `{"token"}`. `qs` arrives
+  already canonicalized by the client and is used verbatim.
+- `POST /decrypt` — `410`. Kept only to explain why envelopes cannot be decoded offline.
+- `GET /cookies` — the jar currently in use, for inspection. It is spent by definition:
+  requests take their own.
+- `GET /health` — liveness plus oracle counters (`signs`, `decrypts`, `rebuilds`, cache
+  hit/miss) and jar buffer depth.
 
 `/refresh-material` and `/load-material` are kept for the client, which still
 calls them to recover from a redeploy. There is no longer any material on disk,
@@ -94,21 +115,27 @@ the page, `/load-material` reports whether it is up.
 | `FLARESOLVERR_URL` | `http://flaresolverr:8191/v1` | FlareSolverr endpoint |
 | `CHROMIUM_PATH` | — | Chromium to drive for the oracle |
 | `COMIX_BASE` | `https://comix.to` | site origin |
-| `ORACLE_READY_TIMEOUT_MS` | `30000` | how long to wait for the bundle to publish its primitives |
+| `ORACLE_READY_TIMEOUT_MS` | `45000` | how long to wait for the bundle to publish its API client |
 | `ORACLE_EVAL_TIMEOUT_MS` | `20000` | per-call evaluation budget |
-| `WAF_CHALLENGES_PER_ROUND` | `5` | captchas sampled before committing to an answer |
-| `WAF_MAX_ROUNDS` | `3` | rounds before giving up on `waf_pass` |
+| `ORACLE_MAX_ATTEMPTS` | `3` | attempts per request; each one costs a fresh jar |
+| `ORACLE_POOL_SIZE` | `4` | pages in flight at once, each on its own jar |
+| `ORACLE_CACHE_TTL_MS` | `300000` | how long a body is reused before it is fetched again |
+| `WAF_JAR_BUFFER` | `6` | jars solved ahead of time |
+
+404/400/422 are not retried: the site's answer about a path will not change, and a retry
+costs a jar.
 
 ## The client side
 
 The `comix-challenge.patch` file in this repository is the client-side half: the
 changes to the Comix Tachiyomi/Suwayumi extension that make it talk to this
-server (proxy preference, `/sign`-minted tokens, `/decrypt`-decoded envelopes,
-mirrored `cf_clearance`/`waf_pass` cookies and UA). The same client changes live
-on the `comix-proxy` branch of the extension repository.
+server. Note that it is stale: it predates `/request` and the flattened response
+shapes. The live client changes are on the `comix-proxy` branch of the extension
+repository, where the extension posts `{path, qs}` to `/request` and reads plain
+JSON back.
 
 ## Disclaimer
 
-This project interacts with the public comix.to web/API surface. The captcha
-solving and cookie handling are for interoperability with an API the extension
-client is already entitled to use. Use at your own discretion.
+This project interacts with the public comix.to web/API surface. The clearance
+handling is for interoperability with an API the extension client is already
+entitled to use. Use at your own discretion.

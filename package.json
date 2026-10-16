@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Token + WAF cookie minting proxy for the comix.to API",
+  "description": "Signed-token and API proxy for comix.to, backed by a headless Chromium oracle",
   "engines": {
     "node": ">=18"
   },
@@ -12,7 +12,6 @@
     "test": "node test-signer.mjs"
   },
   "dependencies": {
-    "playwright": "^1.40.0",
-    "pngjs": "^7.0.0"
+    "playwright": "^1.40.0"
   }
 }

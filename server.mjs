@@ -1,10 +1,10 @@
 // comix-proxy: mints signed `_` tokens and decodes protected bodies for the
-// comix.to API, and maintains the WAF cookies those requests need.
+// comix.to API, and maintains the Cloudflare clearance those requests need.
 //
-//   GET  /sign?path=/api/v1/manga/...&qs=<canonical>[&force=1]
-//        -> { token, waf_pass, cf_clearance, user_agent }
+//   GET  /sign?path=/api/v1/manga/...&qs=<canonical>
+//        -> { token }
 //   POST /request         { path, qs }             -> { json }
-//   GET  /cookies?force=1  -> { waf_pass, cf_clearance, user_agent }
+//   GET  /cookies          -> { cf_clearance, user_agent }
 //   GET  /health           -> { oracle, cookies }
 //
 // The site's crypto now lives behind a bytecode VM that is rebuilt on every deploy,
@@ -17,7 +17,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { signedUrl, apiRequest, rebuild, parseParams, oracleStats } from './lib/oracle.js';
-import { ensureCookies, getCfClearance, jarBufferStats } from './lib/waf.js';
+import { getCfClearance, jarBufferStats, keepBufferFull } from './lib/waf.js';
 import { log, bodySummary } from './lib/log.js';
 
 const PORT = Number(process.env.PORT || 9191);
@@ -77,14 +77,15 @@ const server = http.createServer(async (req, res) => {
       const path = u.searchParams.get('path');
       if (!path) return send(res, 400, { error: 'missing path' });
       const qs = u.searchParams.get('qs') || '';
-      const force = u.searchParams.get('force') === '1';
-      Object.assign(detail, { path, force: force || undefined });
+      Object.assign(detail, { path });
       // The site builds and signs the request itself; the token comes off the wire.
       const url = await signedUrl(path, parseParams(qs));
       const token = url.match(/[?&]_=([^&]+)/);
       if (!token) return send(res, 502, { error: 'site produced no token', url });
-      const cookies = await ensureCookies(force);
-      return send(res, 200, { token: decodeURIComponent(token[1]), ...cookies });
+      // The signed URL is not handed to the caller: a jar buys about one API call, so
+      // sending the cookies with it would leave them spent. Callers wanting the clearance
+      // itself ask /cookies.
+      return send(res, 200, { token: decodeURIComponent(token[1]) });
     }
 
     // A `{"e": ...}` body cannot be decoded on its own, so the request is reissued through
@@ -106,8 +107,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // The jar currently in use. It is spent by definition - every request gets its own - so
+    // this is for inspection, not for making requests with.
     if (u.pathname === '/cookies' && req.method === 'GET') {
-      return send(res, 200, await ensureCookies(u.searchParams.get('force') === '1'));
+      const cf = await getCfClearance();
+      return send(res, 200, {
+        cf_clearance: cf.value,
+        user_agent: cf.userAgent,
+        cookie: cf.jar,
+      });
     }
 
     // The client calls these to recover from a redeploy. With the oracle there is no
@@ -161,6 +169,11 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   log.info('comix-proxy listening', { port: PORT, flaresolverr: process.env.FLARESOLVERR_URL || 'default', logLevel: process.env.LOG_LEVEL || 'info' });
 });
+
+// Every request consumes a cookie jar and FlareSolverr needs ~11s to mint one, so they are
+// solved from startup rather than on demand - otherwise the first request after a restart
+// waits a solve, and a burst after an idle spell waits several.
+keepBufferFull();
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
