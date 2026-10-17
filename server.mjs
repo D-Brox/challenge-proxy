@@ -95,7 +95,18 @@ const server = http.createServer(async (req, res) => {
       if (!path) return send(res, 400, { error: 'missing path' });
       const resolved = params || parseParams(qs || '');
       Object.assign(detail, { path, qs: qs || undefined });
-      const json = await apiRequest(path, resolved);
+      // The client gives up at its own timeout, and by then a jar and a page load are
+      // committed. Notice the hangup so the oracle stops instead of finishing a request
+      // whose answer nobody will read.
+      const gone = new AbortController();
+      const onClose = () => { if (!res.writableEnded) gone.abort(); };
+      res.on('close', onClose);
+      let json;
+      try {
+        json = await apiRequest(path, resolved, { signal: gone.signal });
+      } finally {
+        res.off('close', onClose);
+      }
       Object.assign(detail, bodySummary(json));
       return send(res, 200, { json });
     }
@@ -156,6 +167,12 @@ const server = http.createServer(async (req, res) => {
 
     send(res, 404, { error: 'not found' });
   } catch (e) {
+    // The caller hanging up is not a failure of anything, and logging it as one buries the
+    // failures that are worth looking at.
+    if (e && e.abandoned) {
+      log.info(`client left before the answer was ready on ${req.method} ${u.pathname}`, { ...detail });
+      return;
+    }
     // the stack is what tells a spent cookie jar apart from a real endpoint change
     log.error(`unhandled failure on ${req.method} ${u.pathname}`, {
       error: String((e && e.message) || e),

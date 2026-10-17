@@ -25,14 +25,45 @@ still dead a minute later. The 502 is Cloudflare reporting that comix.to's own o
 failed (`origin_bad_gateway`, `retry-after: 60`), not a rate limit and not the site's
 "no user input" flag, which is not set on those requests.
 
-So every request is served from a freshly solved jar and the page holding it is thrown
-away afterwards. FlareSolverr needs ~11s per jar, so jars are solved continuously into a
-buffer and a request takes one that is ready. That is the ceiling on request rate: adding
-FlareSolverr replicas is the only way to raise it. Responses are cached for five minutes,
-because repeat browsing is otherwise a fresh jar per repeat.
+So a jar is **kept until it actually fails**, rather than spent on a guess. One page holds one
+jar and serves many requests; the first failure discards both and the retry builds a fresh
+pair. Measured on a warm pool: 40 requests across bursts of 8, 16 and 24 consumed **no jars at
+all**, with a 24-concurrent burst finishing in 2s.
 
-Loading an HTML page is free — only the API call is charged — and responses Cloudflare
-can serve from its edge (`x-cache: HIT`) never reach the origin.
+The allowance is not a fixed number. Measured the same day on the same code at 1 call, then at
+2-34, then at 45+, so budgeting against a constant would have been wrong in both directions.
+A jar that has stopped answering never recovers: it was still refused after three separate
+120-second silences, while a fresh jar worked at the same moment. So the refusal is a count
+rather than a penalty, and it is keyed to the session rather than the address - fresh jars
+succeed consecutively from one IP.
+
+What does *not* buy anything, all measured: slowing down (gaps of 0.3s to 10s, randomised
+2.5-5s as upstream paces), real clicks instead of the keystroke poke, booting on
+`/title/<hid>` instead of `/browse`, or letting 120s pass. The site's own `v` input flag reads
+`0` on the successful request and on the refused one, so the refusal is not that counter.
+
+Solved jars are written to disk under `WAF_JAR_STORE` and reloaded at startup, so a restart
+inside the ~25 minutes a clearance is good for comes back warm - that covers a redeploy or a
+crash. It survives `docker restart` on its own; mount a volume over `WAF_JAR_STORE` to also
+survive a rebuild, which replaces the container. A request whose client has already given up is
+abandoned rather than finished, since a jar and a page load are committed by then.
+
+Loading an HTML page is free - only the API call is charged - and responses Cloudflare can
+serve from its edge (`x-cache: HIT`) never reach the origin.
+
+### What this can and cannot keep up with
+
+While jars are being reused, FlareSolverr is off the critical path entirely. It matters only
+when the site has withdrawn an allowance, and then its capacity is the ceiling: about **3
+solves at once**, each ~11s - measured at 1, 2 and 3 concurrent succeeding in 11-12s, the
+fourth failing, and six taking 23s for *less* throughput than three. Asking for more just
+builds a queue inside FlareSolverr, where entries past the front hit their own `maxTimeout`
+and are failed outright. So `WAF_JAR_BUFFER` (stock to keep) is deliberately separate from
+`WAF_SOLVE_CONCURRENCY` (how hard FlareSolverr is driven).
+
+In that degraded mode the ceiling is ~0.25 requests/second. Raising client timeouts does not
+move it, because the work cannot be done faster - only more FlareSolverr instances, or a
+longer cache TTL to cut the demand, will.
 
 ## The recovered cipher
 
@@ -119,8 +150,12 @@ the page, `/load-material` reports whether it is up.
 | `ORACLE_EVAL_TIMEOUT_MS` | `20000` | per-call evaluation budget |
 | `ORACLE_MAX_ATTEMPTS` | `3` | attempts per request; each one costs a fresh jar |
 | `ORACLE_POOL_SIZE` | `4` | pages in flight at once, each on its own jar |
-| `ORACLE_CACHE_TTL_MS` | `300000` | how long a body is reused before it is fetched again |
-| `WAF_JAR_BUFFER` | `6` | jars solved ahead of time |
+| `ORACLE_REUSE_MAX` | `50` | requests one jar serves before being replaced regardless |
+| `ORACLE_CACHE_TTL_MS` | `900000` | how long a body is reused before it is fetched again |
+| `WAF_JAR_BUFFER` | `20` | jars solved ahead of time |
+| `WAF_SOLVE_CONCURRENCY` | `3` | solves in flight at once — FlareSolverr's capacity, not the buffer depth |
+| `WAF_JAR_STORE` | `/app/.jars` | where solved jars are kept across a restart |
+| `WAF_JAR_MIN_LIFE_MS` | `300000` | don't keep or hand out a jar with less life than this |
 
 404/400/422 are not retried: the site's answer about a path will not change, and a retry
 costs a jar.
