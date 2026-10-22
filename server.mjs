@@ -1,22 +1,22 @@
-// comix-proxy: mints signed `_` tokens and decodes protected bodies for the
-// comix.to API, and maintains the Cloudflare clearance those requests need.
+// comix-proxy: answers the comix.to API paths the comix extension consumes by running
+// them through the site's own bundle, and maintains the Cloudflare clearance those
+// requests need.
 //
-//   GET  /sign?path=/api/v1/manga/...&qs=<canonical>
-//        -> { token }
 //   POST /request         { path, qs }             -> { json }
 //   GET  /cookies          -> { cf_clearance, user_agent }
 //   GET  /health           -> { oracle, cookies }
 //
-// The site's crypto now lives behind a bytecode VM that is rebuilt on every deploy,
-// so it is not reimplemented here: lib/oracle.js keeps the real bundle loaded in a
-// headless Chromium and asks it. A redeploy therefore needs no change here.
+// The new site build has no `/api/v1` pass-through client left to ask: its API now lives
+// in hidden store members that map every response into obfuscated view models. The
+// oracle (lib/oracle.js) finds those members on the live bundle and applies an extracted
+// reverse-mapper registry over their output, so this server still hands out plain JSON.
+// A redeploy therefore needs no change here beyond a fresh registry if keys churn.
 //
 // `qs` arrives already canonicalized by the client (keys sorted, arrays expanded to
-// `key[i]`, values raw) and is used verbatim - re-encoding it would change what the
-// token covers.
+// `key[i]`, values raw) and is passed to the store members verbatim.
 import http from 'node:http';
 import { URL } from 'node:url';
-import { signedUrl, apiRequest, rebuild, parseParams, oracleStats } from './lib/oracle.js';
+import { apiRequest, rebuild, parseParams, oracleStats } from './lib/oracle.js';
 import { getCfClearance, jarBufferStats, keepBufferFull } from './lib/waf.js';
 import { log, bodySummary } from './lib/log.js';
 
@@ -73,21 +73,6 @@ const server = http.createServer(async (req, res) => {
   });
 
   try {
-    if (u.pathname === '/sign' && req.method === 'GET') {
-      const path = u.searchParams.get('path');
-      if (!path) return send(res, 400, { error: 'missing path' });
-      const qs = u.searchParams.get('qs') || '';
-      Object.assign(detail, { path });
-      // The site builds and signs the request itself; the token comes off the wire.
-      const url = await signedUrl(path, parseParams(qs));
-      const token = url.match(/[?&]_=([^&]+)/);
-      if (!token) return send(res, 502, { error: 'site produced no token', url });
-      // The signed URL is not handed to the caller: a jar buys about one API call, so
-      // sending the cookies with it would leave them spent. Callers wanting the clearance
-      // itself ask /cookies.
-      return send(res, 200, { token: decodeURIComponent(token[1]) });
-    }
-
     // A `{"e": ...}` body cannot be decoded on its own, so the request is reissued through
     // the site's own client instead of being replayed. See lib/oracle.js apiRequest.
     if (u.pathname === '/request' && req.method === 'POST') {
@@ -161,7 +146,7 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/' || u.pathname === '') {
       return send(res, 200, {
-        endpoints: ['/sign', '/request', '/decrypt', '/cookies', '/health', '/refresh-material', '/load-material'],
+        endpoints: ['/request', '/decrypt', '/cookies', '/health', '/refresh-material', '/load-material'],
       });
     }
 
